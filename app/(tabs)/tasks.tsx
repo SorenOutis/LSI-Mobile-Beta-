@@ -1,7 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
 import { useCallback, useEffect, useState } from 'react';
 import * as Linking from 'expo-linking';
-import { Alert, Modal, Platform, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { Alert, Modal, Platform, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { api, errorMessage, webLink } from '@/lib/api';
 import { useAuth } from '@/context/AuthContext';
@@ -15,7 +15,6 @@ export default function TasksScreen() {
   const [showFeedback, setShowFeedback] = useState(false);
   const [submitFor, setSubmitFor] = useState<any>(null);
   const [feedbackFor, setFeedbackFor] = useState<any>(null);
-  const [submitText, setSubmitText] = useState('');
   const [busy, setBusy] = useState(false);
   const { token } = useAuth();
   const [assignments, setAssignments] = useState<any[] | null>(null);
@@ -27,7 +26,7 @@ export default function TasksScreen() {
     setLoading(true);
     setError(null);
     try {
-      const r: any = await api.get('/assignments');
+      const r: any = await api.get('/mobile/assignments');
       const d = r.data ?? r;
       setAssignments(d.assignments ?? d ?? []);
     } catch (e) {
@@ -44,30 +43,16 @@ export default function TasksScreen() {
 
   const openSubmit = (a: any) => {
     setSubmitFor(a);
-    setSubmitText('');
     setShowSubmit(true);
   };
 
-  const doSubmit = async () => {
+  // Real submissions are file uploads (the API requires a multipart `file`).
+  // The mobile client doesn't pick/upload files yet, so it links to the web
+  // app instead of faking a text-based submit.
+  const openWebSubmit = () => {
     const a = submitFor;
-    if (!a) return;
-    const content = submitText.trim();
-    if (!content) {
-      Alert.alert('Nothing to submit', 'Paste a link or text for your submission first.');
-      return;
-    }
-    setBusy(true);
-    try {
-      await api.post(`/assignments/${a.id}/submit`, { content });
-      setAssignments((prev) =>
-        (prev ?? []).map((x: any) => (x.id === a.id ? { ...x, submission: { ...(x.submission ?? {}), submitted: true } } : x))
-      );
-      setShowSubmit(false);
-    } catch (e) {
-      Alert.alert('Submit failed', errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
+    setShowSubmit(false);
+    if (a) Linking.openURL(webLink(`/assignments/${a.id}`));
   };
 
   const markFeedbackSeen = async () => {
@@ -75,7 +60,7 @@ export default function TasksScreen() {
     if (!a) return;
     setBusy(true);
     try {
-      await api.post(`/assignments/${a.id}/feedback/read`);
+      await api.post(`/mobile/assignments/${a.id}/feedback-seen`);
       setAssignments((prev) =>
         (prev ?? []).map((x: any) => (x.id === a.id ? { ...x, submission: { ...(x.submission ?? {}), has_unseen_feedback: false } } : x))
       );
@@ -132,7 +117,7 @@ export default function TasksScreen() {
           )}
           <View style={{ height: 20 }} />
         </ScrollView>
-        <Modal visible={showSubmit} transparent animationType="slide" onRequestClose={() => setShowSubmit(false)}><View style={styles.modalOverlay}><View style={styles.modalSheet}><View style={styles.handle} /><Text style={styles.modalTitle}>Submit: {submitFor?.title ?? 'assignment'}</Text><View style={styles.inputWrap}><TextInput value={submitText} onChangeText={setSubmitText} placeholder="Paste link or submission text..." placeholderTextColor="#9AA0A6" multiline style={styles.modalInput} /></View><View style={styles.modalRow}><TouchableOpacity onPress={() => setShowSubmit(false)} style={styles.modalCancel}><Text style={styles.modalCancelText}>Cancel</Text></TouchableOpacity><TouchableOpacity onPress={doSubmit} disabled={busy} style={[styles.modalConfirm, busy && { opacity: 0.7 }]}><Text style={styles.modalConfirmText}>{busy ? 'Submitting...' : 'Submit'}</Text></TouchableOpacity></View></View></View></Modal>
+        <Modal visible={showSubmit} transparent animationType="slide" onRequestClose={() => setShowSubmit(false)}><View style={styles.modalOverlay}><View style={styles.modalSheet}><View style={styles.handle} /><Text style={styles.modalTitle}>Submit: {submitFor?.title ?? 'assignment'}</Text><Text style={styles.groupNote}>Submissions are file uploads (PDF, DOCX, or image — up to 10 MB). File picking isn&apos;t available in the mobile app yet, so submissions open in the web app.</Text><View style={styles.modalRow}><TouchableOpacity onPress={() => setShowSubmit(false)} style={styles.modalCancel}><Text style={styles.modalCancelText}>Cancel</Text></TouchableOpacity><TouchableOpacity onPress={openWebSubmit} style={styles.modalConfirm}><Text style={styles.modalConfirmText}>Open in web app</Text></TouchableOpacity></View></View></View></Modal>
         <Modal visible={showGroup} transparent animationType="fade" onRequestClose={() => setShowGroup(false)}><View style={styles.modalOverlay}><View style={styles.modalCard}><Text style={styles.modalTitle}>Group assignments</Text><Text style={styles.groupNote}>Group submissions are managed on the LUA V6 web app for now.</Text><TouchableOpacity onPress={() => Linking.openURL(webLink('/assignments'))} style={styles.modalConfirm}><Text style={styles.modalConfirmText}>Open in web app</Text></TouchableOpacity><TouchableOpacity onPress={() => setShowGroup(false)} style={styles.modalCancel}><Text style={styles.modalCancelText}>Close</Text></TouchableOpacity></View></View></Modal>
         <Modal visible={showFeedback} transparent animationType="fade" onRequestClose={() => setShowFeedback(false)}><View style={styles.modalOverlay}><View style={styles.modalCard}><Text style={styles.modalTitle}>Feedback</Text><Text style={styles.groupNote}>{feedbackFor?.submission?.feedback ?? feedbackFor?.feedback ?? 'Your teacher\'s feedback will appear here. Mark it as seen to hide the badge.'}</Text><TouchableOpacity onPress={markFeedbackSeen} disabled={busy} style={[styles.modalConfirm, busy && { opacity: 0.7 }]}><Text style={styles.modalConfirmText}>{busy ? 'Updating...' : 'Mark as seen'}</Text></TouchableOpacity><TouchableOpacity onPress={() => setShowFeedback(false)} style={styles.modalCancel}><Text style={styles.modalCancelText}>Close</Text></TouchableOpacity></View></View></Modal>
       </View>
@@ -173,8 +158,6 @@ const styles = StyleSheet.create({
   modalCard: { width: '100%', maxWidth: 360, backgroundColor: '#fff', borderRadius: 16, padding: 20, gap: 12, alignItems: 'center' },
   handle: { width: 40, height: 4, borderRadius: 2, backgroundColor: '#EAE5DE', alignSelf: 'center' },
   modalTitle: { fontSize: 16, fontWeight: '900', color: '#1A1E22', textAlign: 'center' },
-  inputWrap: { width: '100%', borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 10, paddingHorizontal: 12, backgroundColor: '#fff' },
-  modalInput: { paddingVertical: 12, fontSize: 14, color: '#1A1E22', minHeight: 60 } as any,
   modalRow: { flexDirection: 'row', gap: 10, width: '100%' },
   modalCancel: { flex: 1, borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 10, paddingVertical: 12, alignItems: 'center', backgroundColor: '#fff' },
   modalCancelText: { fontWeight: '700', color: '#1A1E22', fontSize: 13 },

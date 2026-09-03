@@ -21,7 +21,7 @@ export default function CourseDetail() {
     setLoaded(false);
     setError(null);
     try {
-      const r: any = await api.get(`/courses/${id}`);
+      const r: any = await api.get(`/mobile/courses/${id}`);
       setCourse(r.data ?? r);
     } catch (e) {
       setError(errorMessage(e));

@@ -19,7 +19,7 @@ export default function AgendaScreen() {
     setLoading(true);
     setError(null);
     try {
-      const r: any = await api.get('/calendar');
+      const r: any = await api.get('/mobile/calendar');
       setData(r.data ?? r);
     } catch (e) {
       setError(errorMessage(e));

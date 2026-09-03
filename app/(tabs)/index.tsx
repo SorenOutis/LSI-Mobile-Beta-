@@ -26,7 +26,7 @@ export default function HomeScreen() {
   const fetchDashboard = useCallback(async () => {
     if (!token) { setLoading(false); return; }
     try {
-      const r: any = await api.get('/dashboard');
+      const r: any = await api.get('/mobile/dashboard');
       const d = r.data ?? r;
       setDash(d);
       if (d.xpHistory) setXpHistory(d.xpHistory);
@@ -148,7 +148,7 @@ export default function HomeScreen() {
 
   const handleClaim = async () => {
     try {
-      await api.post('/claim-xp');
+      await api.post('/mobile/claim-xp');
       setXpClaimed(true);
       setShowDailyClaim(false);
       fetchDashboard();
@@ -160,7 +160,7 @@ export default function HomeScreen() {
   const handleJoin = async () => {
     if (!joinCode.trim()) return;
     try {
-      await api.post('/sections/join-by-code', { code: joinCode.trim() });
+      await api.post('/mobile/sections/join-by-code', { code: joinCode.trim() });
       setShowJoin(false);
       setJoinCode('');
       fetchDashboard();

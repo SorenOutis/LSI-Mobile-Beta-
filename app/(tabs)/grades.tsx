@@ -17,7 +17,7 @@ export default function GradesScreen() {
     setLoading(true);
     setError(null);
     try {
-      const r: any = await api.get('/grades');
+      const r: any = await api.get('/mobile/grades');
       setData(r.data ?? r);
     } catch (e) {
       setError(errorMessage(e));

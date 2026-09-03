@@ -1,53 +1,33 @@
 import * as SecureStore from 'expo-secure-store';
-import Constants from 'expo-constants';
 import { Platform } from 'react-native';
 import { useSyncExternalStore } from 'react';
 
 const isWeb = Platform.OS === 'web';
 
-// LUA V6 backend port (the web app is served on this port; API routes live under /api).
-const API_PORT = 9000;
-
-function isAndroidEmulator(): boolean {
-  if (Platform.OS !== 'android') return false;
-  const fp: string | undefined = (Platform.constants as any)?.build?.FINGERPRINT;
-  if (!fp) return false;
-  return /google|generic|sdk_gphone|emulator|simulator|redhat/i.test(fp);
-}
-
 // ---------------------------------------------------------------------------
 // Base URL resolution.
-//  1. EXPO_PUBLIC_API_URL — explicit override (use this for production HTTPS).
-//  2. Web — localhost (Metro proxies /api to the backend, or the backend is local).
-//  3. Android emulator — 10.0.2.2 aliases the host machine's loopback.
-//  4. Physical device — the dev machine's LAN IP (from `hostUri`), same Wi-Fi.
+//  1. EXPO_PUBLIC_API_URL — explicit override (set this for a local dev
+//     server while testing; the committed .env points at the live app).
+//  2. Default — the deployed LUA V6 backend (https://lsi.koamishin.com).
+//
+// The deployed backend exposes the /api/mobile/* JSON surface (see
+// patches/luav6-mobile-api.patch in this repo — apply it to the luav6 repo
+// and redeploy before using the app in production).
 // ---------------------------------------------------------------------------
+const LIVE_API_URL = 'https://lsi.koamishin.com';
+
 const getBaseUrl = (): string => {
-  const fromEnv = process.env.EXPO_PUBLIC_API_URL as string | undefined;
-  if (fromEnv) {
-    const url = fromEnv.replace(/\/$/, '');
-    if (isWeb) return url;
-    if (/localhost|127\.0\.0\.1/.test(url)) {
-      if (Platform.OS === 'android' && !isAndroidEmulator()) {
-        console.warn(
-          '[api] EXPO_PUBLIC_API_URL points at localhost, which is unreachable from a physical Android device. Set it to your machine\'s LAN IP (e.g. http://192.168.1.20:9000) or http://10.0.2.2:9000 on the emulator.'
-        );
-      } else if (Platform.OS === 'ios') {
-        console.warn(
-          '[api] EXPO_PUBLIC_API_URL points at localhost — only the iOS simulator can reach it. On a physical iPhone set it to your machine\'s LAN IP.'
-        );
-      }
-    }
-    if (url.startsWith('http://') && !__DEV__) {
-      console.warn('[api] Non-dev build is using plain HTTP. Use an EXPO_PUBLIC_API_URL with https:// for release builds.');
-    }
-    return url;
+  const fromEnv = (process.env.EXPO_PUBLIC_API_URL as string | undefined) || LIVE_API_URL;
+  const url = fromEnv.replace(/\/$/, '');
+  if (/localhost|127\.0\.0\.1/.test(url) && !isWeb) {
+    console.warn(
+      `[api] ${url} is only reachable from the machine running the dev server (emulator via 10.0.2.2, iOS simulator, or same-Wi-Fi LAN IP). For live data use https://lsi.koamishin.com.`
+    );
   }
-  if (isWeb) return `http://localhost:${API_PORT}`;
-  if (Platform.OS === 'android' && isAndroidEmulator()) return `http://10.0.2.2:${API_PORT}`;
-  const host = (Constants.expoConfig?.hostUri || '').split(':')[0];
-  if (host) return `http://${host}:${API_PORT}`;
-  return `http://localhost:${API_PORT}`;
+  if (url.startsWith('http://') && !__DEV__) {
+    console.warn('[api] Non-dev build is using plain HTTP. Use an EXPO_PUBLIC_API_URL with https:// for release builds.');
+  }
+  return url;
 };
 
 export const API_BASE_URL = getBaseUrl();
@@ -198,8 +178,13 @@ export const api = {
     request<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) }),
   put: <T,>(path: string, body?: unknown): Promise<T> =>
     request<T>(path, { method: 'PUT', body: body === undefined ? undefined : JSON.stringify(body) }),
+  patch: <T,>(path: string, body?: unknown): Promise<T> =>
+    request<T>(path, { method: 'PATCH', body: body === undefined ? undefined : JSON.stringify(body) }),
   delete: <T,>(path: string): Promise<T> => request<T>(path, { method: 'DELETE' }),
   /** For FormData (e.g. assignment file upload). */
   postForm: <T,>(path: string, formData: FormData): Promise<T> =>
     request<T>(path, { method: 'POST', body: formData }),
+  /** For FormData uploads via PATCH (e.g. profile avatar). */
+  patchForm: <T,>(path: string, formData: FormData): Promise<T> =>
+    request<T>(path, { method: 'PATCH', body: formData }),
 };

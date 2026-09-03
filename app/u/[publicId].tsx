@@ -23,7 +23,7 @@ export default function PublicProfileScreen() {
     setLoading(true);
     setError(null);
     try {
-      const r: any = await api.get(`/u/${publicId}`);
+      const r: any = await api.get(`/mobile/u/${publicId}`);
       setData(r.data ?? r);
     } catch (e) {
       setData(null);
@@ -42,9 +42,9 @@ export default function PublicProfileScreen() {
     setFollowLoading(true);
     try {
       if (data.isFollowing) {
-        await api.delete(`/u/${publicId}/follow`);
+        await api.delete(`/mobile/u/${publicId}/follow`);
       } else {
-        await api.post(`/u/${publicId}/follow`);
+        await api.post(`/mobile/u/${publicId}/follow`);
       }
       setData((prev: any) => ({ ...prev, isFollowing: !prev.isFollowing, stats: { ...prev.stats, followersCount: prev.isFollowing ? prev.stats.followersCount - 1 : prev.stats.followersCount + 1 } }));
     } catch (e) {
@@ -56,8 +56,8 @@ export default function PublicProfileScreen() {
 
   const sendKudo = async (type: string) => {
     try {
-      await api.post(`/u/${publicId}/kudos`, { type });
-      const r: any = await api.get(`/u/${publicId}`);
+      await api.post(`/mobile/u/${publicId}/kudos`, { type });
+      const r: any = await api.get(`/mobile/u/${publicId}`);
       setData(r.data ?? r);
     } catch (e) {
       Alert.alert('Could not send kudos', errorMessage(e));

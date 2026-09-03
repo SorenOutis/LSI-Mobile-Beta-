@@ -23,7 +23,7 @@ export default function ExamsScreen() {
     setLoading(true);
     setError(null);
     try {
-      const r: any = await api.get('/exams');
+      const r: any = await api.get('/mobile/exams');
       const d = r.data.data ?? r.data ?? [];
       setGroups(Array.isArray(d) ? d : []);
     } catch (e) {

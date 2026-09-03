@@ -41,7 +41,7 @@ export default function CoursesScreen() {
     setStatus('loading');
     setError(null);
     try {
-      const r: any = await api.get('/courses');
+      const r: any = await api.get('/mobile/courses');
       const d = r.data ?? r;
       const list: Course[] = Array.isArray(d) ? d : d.courses ?? d.data ?? [];
       setCourses(list);

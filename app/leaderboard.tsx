@@ -19,7 +19,7 @@ export default function LeaderboardFull() {
     setLoading(true);
     setError(null);
     try {
-      const r: any = await api.get('/leaderboard');
+      const r: any = await api.get('/mobile/leaderboard');
       setData(r.data ?? r);
     } catch (e) {
       setError(errorMessage(e));
@@ -32,7 +32,7 @@ export default function LeaderboardFull() {
   useEffect(() => {
     load();
   }, [load]);
-  const boards: any[] = data?.sectionLeaderboards ?? data?.data ?? [];
+  const boards: any[] = data?.leaderboards ?? data?.sectionLeaderboards ?? data?.data ?? [];
   const first = boards[0];
   return (
     <SafeAreaView style={styles.safe} edges={['top']}>

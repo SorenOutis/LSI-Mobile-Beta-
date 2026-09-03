@@ -9,17 +9,23 @@ import { fmtTime, parseDate } from '@/lib/format';
 import { PageSkeleton } from '@/components/PageSkeleton';
 
 // ---------------------------------------------------------------------------
-// Real exam flow against LUA V6. Mirrors resources/js/pages/Exams/Show.vue:
-//   GET  /exams/{id}                         → exam + parts + questions (+ review data when locked)
-//   PUT  /exams/{id}/parts/{partId}/answers  → autosave  { answers: { [questionIndex]: value } }
-//   POST /exams/{id}/parts/{partId}/submit   → submit the part
-// Answers are keyed by 0-based question index within a part (matches the web
-// draft shape `exam_draft_*`). If your routes differ, adjust ENDPOINTS below.
+// Real exam flow against the LUA V6 mobile API (routes/api.php → /api/mobile):
+//   GET  /mobile/exams/{id}                    → exam{parts, is_open_now,...} + submissions + partDeadlines + answerDrafts + xpAward
+//   POST /mobile/exams/{id}/parts/{p}/start    → {started_at, deadline} (authoritative clock)
+//   PUT  /mobile/exams/{id}/parts/{p}/answers  → autosave {answers: [{question_number, answer}]}
+//   POST /mobile/exams/{id}/parts/{p}/submit   → {submitted_part}
+//   POST /mobile/exams/{id}/parts/{p}/status   → grading status + xp_award
+//   GET  /mobile/exams/{id}/review             → per-question results once the exam is closed (403 before)
+// The client keys answers by 0-based question index (UI); the server keys by
+// 1-based question_number, so every payload goes through toAnswerList().
 // ---------------------------------------------------------------------------
 const ENDPOINTS = {
-  show: (id: string | number) => `/exams/${id}`,
-  saveAnswers: (id: string | number, partId: number) => `/exams/${id}/parts/${partId}/answers`,
-  submitPart: (id: string | number, partId: number) => `/exams/${id}/parts/${partId}/submit`,
+  show: (id: string | number) => `/mobile/exams/${id}`,
+  startPart: (id: string | number, partId: number) => `/mobile/exams/${id}/parts/${partId}/start`,
+  saveAnswers: (id: string | number, partId: number) => `/mobile/exams/${id}/parts/${partId}/answers`,
+  submitPart: (id: string | number, partId: number) => `/mobile/exams/${id}/parts/${partId}/submit`,
+  partStatus: (id: string | number, partId: number) => `/mobile/exams/${id}/parts/${partId}/status`,
+  review: (id: string | number) => `/mobile/exams/${id}/review`,
 };
 
 type Question = {
@@ -45,13 +51,32 @@ type Part = {
   is_submitted?: boolean;
   answers?: Record<number, any>;
   user_answers?: Record<number, any>;
-  xp_award?: any;
+  score?: number | null;
+  submissionStatus?: string | null;
   [key: string]: any;
 };
 
 type SaveState = 'idle' | 'saving' | 'saved' | 'error';
 
 const partSubmitted = (p: Part) => Boolean(p.submitted ?? p.is_submitted);
+
+// The client keys answers by 0-based question index (UI); the server expects
+// 1-based question_number entries (SaveExamAnswersRequest / SubmitExamPartRequest).
+const toAnswerList = (rec: Record<number, any>) =>
+  Object.entries(rec)
+    .filter(([, v]) => v !== undefined)
+    .map(([i, v]) => ({ question_number: Number(i) + 1, answer: v ?? null }));
+
+// Server draft shape: [{question_number, answer}] → 0-based client record.
+const draftToRecord = (list: any[]): Record<number, any> => {
+  const rec: Record<number, any> = {};
+  for (const a of list ?? []) {
+    const n = Number(a?.question_number);
+    if (!Number.isFinite(n) || n < 1) continue;
+    rec[n - 1] = a.answer ?? null;
+  }
+  return rec;
+};
 
 export default function ExamTakeScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -76,11 +101,23 @@ export default function ExamTakeScreen() {
   const [pendingSubmit, setPendingSubmit] = useState(false);
   const [showSuccess, setShowSuccess] = useState(false);
   const [showDone, setShowDone] = useState(false);
-  const [xpAward, setXpAward] = useState<{ total: number; completion: number; accuracy: number } | null>(null);
+  const [xpAward, setXpAward] = useState<{ completion_xp: number; accuracy_xp: number; on_time_xp: number; total_xp: number; accuracy_pending?: boolean } | null>(null);
+  const [lastPartStatus, setLastPartStatus] = useState<any>(null);
+  // Authoritative server state from GET /mobile/exams/{id}: per-part active
+  // deadlines, DB-persisted answer drafts, and the user's submissions.
+  const serverStateRef = useRef<{
+    partDeadlines: Record<string, string | null>;
+    answerDrafts: Record<string, { answers: any[] }>;
+    submissions: Record<string, any>;
+  }>({ partDeadlines: {}, answerDrafts: {}, submissions: {} });
+  // Review data (fetched after the exam closes): partId → 0-based answers + score.
+  const [reviewByPart, setReviewByPart] = useState<Record<number, { answers: Record<number, any>; score: number | null; status: string | null }>>({});
 
   const examId = Number(id);
   const examTitle = exam?.title ?? exam?.name ?? 'Exam';
-  const examIsLocked = Boolean(exam?.is_locked) || exam?.status === 'locked' || exam?.status === 'submitted';
+  const examClosed = exam?.is_open_now === false;
+  const examIsLocked =
+    (parts.length > 0 && submittedParts.size >= parts.length) || (examClosed && submittedParts.size > 0);
   const activePart = activeIdx != null ? parts[activeIdx] : null;
 
   // ---------------------------------------------------------------- load
@@ -91,11 +128,38 @@ export default function ExamTakeScreen() {
     try {
       const r: any = await api.get(ENDPOINTS.show(id));
       const data = r.data ?? r;
-      setExam(data);
-      const ps: Part[] = (data.parts ?? data.data?.parts ?? []).filter((p: any) => p && Array.isArray(p.questions));
+      const examData = data.exam ?? data;
+      setExam(examData);
+      const ps: Part[] = (examData.parts ?? data.parts ?? []).filter((p: any) => p && Array.isArray(p.questions));
       setParts(ps);
-      setSubmittedParts(new Set(ps.filter(partSubmitted).map((p) => p.id)));
+      const subs: Record<string, any> = data.submissions ?? {};
+      setSubmittedParts(new Set(ps.filter((p) => subs[String(p.id)]?.status).map((p) => p.id)));
+      serverStateRef.current = {
+        partDeadlines: data.partDeadlines ?? {},
+        answerDrafts: data.answerDrafts ?? {},
+        submissions: subs,
+      };
+      if (data.xpAward) setXpAward({ ...data.xpAward });
       setLoaded(true);
+      // Once the exam is closed, results unlock — fetch the review payload for
+      // per-question answers and scores. 403 means it's still open; stay honest.
+      if (examData.is_open_now === false) {
+        api
+          .get(ENDPOINTS.review(id))
+          .then((rv: any) => {
+            const rd = rv.data ?? rv;
+            const byPart: Record<number, { answers: Record<number, any>; score: number | null; status: string | null }> = {};
+            for (const sub of rd.submissions ?? []) {
+              const pid = Number(sub.exam_part_id);
+              if (!pid) continue;
+              byPart[pid] = { answers: draftToRecord(sub.answers ?? []), score: sub.score ?? null, status: sub.status ?? null };
+            }
+            setReviewByPart(byPart);
+          })
+          .catch(() => {
+            /* review still sealed — nothing to show yet */
+          });
+      }
     } catch (e) {
       setLoadError(errorMessage(e));
       setLoaded(true);
@@ -170,11 +234,15 @@ export default function ExamTakeScreen() {
     if (activeIdx == null || examIsLocked) return;
     const part = parts[activeIdx];
     if (!part) return;
+    if (Object.keys(answers).length === 0) {
+      setSaveState('idle'); // server requires at least one answer; nothing to save yet
+      return;
+    }
     setSaveState('saving');
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(async () => {
       try {
-        await api.put(ENDPOINTS.saveAnswers(examId, part.id), { answers });
+        await api.put(ENDPOINTS.saveAnswers(examId, part.id), { answers: toAnswerList(answers) });
         lastSaved.current = { partId: part.id, answers };
         setSaveState('saved');
       } catch {
@@ -201,8 +269,9 @@ export default function ExamTakeScreen() {
       const part = parts[idx];
       const current = answersRef.current;
       const last = lastSaved.current;
-      if (!part || (last && last.partId === part.id && JSON.stringify(last.answers) === JSON.stringify(current))) return;
-      api.put(ENDPOINTS.saveAnswers(examId, part.id), { answers: current }).catch(() => {});
+      if (!part || Object.keys(current).length === 0) return;
+      if (last && last.partId === part.id && JSON.stringify(last.answers) === JSON.stringify(current)) return;
+      api.put(ENDPOINTS.saveAnswers(examId, part.id), { answers: toAnswerList(current) }).catch(() => {});
     };
   }, [parts, examId]);
 
@@ -225,18 +294,33 @@ export default function ExamTakeScreen() {
   const confirmStart = () => {
     if (pendingIdx == null) return;
     const part = parts[pendingIdx];
-    // Seed with previously saved answers if the server returned them.
-    const prev = part.answers ?? part.user_answers ?? {};
-    setAnswers(prev && typeof prev === 'object' ? { ...prev } : {});
+    // Seed with the DB-persisted draft from the show payload (survives reloads).
+    const draft = serverStateRef.current.answerDrafts[String(part.id)]?.answers;
+    const prev = Array.isArray(draft) ? draftToRecord(draft) : {};
+    setAnswers({ ...prev });
     setFlagged(new Set());
     setMobileIndex(0);
     setActiveIdx(pendingIdx);
     setPendingIdx(null);
     setShowStartModal(false);
     setSaveState('idle');
-    const d = computeDeadline();
+    // Prefer the server's active per-part deadline; fall back to the exam clock.
+    const serverDeadline = parseDate(serverStateRef.current.partDeadlines[String(part.id)] ?? '');
+    const d = serverDeadline ? serverDeadline.getTime() : computeDeadline();
     setDeadlineMs(d);
     if (d) setTimeLeft(Math.max(0, Math.floor((d - Date.now()) / 1000)));
+    // Start (or resume) the server-side clock — it is authoritative and cannot
+    // be reset by reloading. Best-effort: the local countdown keeps running.
+    api
+      .post(ENDPOINTS.startPart(examId, part.id))
+      .then((sr: any) => {
+        const dd = parseDate(sr?.deadline);
+        if (dd) {
+          setDeadlineMs(dd.getTime());
+          setTimeLeft(Math.max(0, Math.floor((dd.getTime() - Date.now()) / 1000)));
+        }
+      })
+      .catch(() => {});
   };
 
   // -------------------------------------------------------- submit part
@@ -256,23 +340,21 @@ export default function ExamTakeScreen() {
       try {
         // Save answers right before submitting so nothing is lost.
         try {
-          await api.put(ENDPOINTS.saveAnswers(examId, part.id), { answers });
+          if (Object.keys(answers).length > 0) {
+            await api.put(ENDPOINTS.saveAnswers(examId, part.id), { answers: toAnswerList(answers) });
+          }
         } catch {
           /* submit endpoint is the source of truth */
         }
-        const res: any = await api.post(ENDPOINTS.submitPart(examId, part.id), { answers });
+        await api.post(ENDPOINTS.submitPart(examId, part.id), { answers: toAnswerList(answers) });
         const newSubmitted = new Set(submittedParts);
         newSubmitted.add(part.id);
         setSubmittedParts(newSubmitted);
-        const data = res?.data ?? res;
-        const xp = data?.xp_award ?? data?.xpAward ?? part.xp_award;
-        if (xp && typeof xp === 'object') {
-          setXpAward({
-            total: Number(xp.total ?? xp.amount ?? 0),
-            completion: Number(xp.completion ?? 0),
-            accuracy: Number(xp.accuracy ?? 0),
-          });
-        }
+        // Essays grade asynchronously — partStatus reports the honest state
+        // and the current XP award for this submission.
+        const st: any = await api.post(ENDPOINTS.partStatus(examId, part.id)).catch(() => null);
+        setLastPartStatus(st ?? null);
+        if (st?.xp_award && typeof st.xp_award === 'object') setXpAward({ ...st.xp_award });
         setShowSuccess(true);
         if (newSubmitted.size >= parts.length) {
           setTimeout(() => {
@@ -349,7 +431,11 @@ export default function ExamTakeScreen() {
           <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
             <View style={styles.reviewBanner}>
               <Ionicons name="checkmark-circle" size={18} color="#3A7D5C" />
-              <Text style={styles.reviewBannerText}>This exam is submitted — you&apos;re viewing your results.</Text>
+              <Text style={styles.reviewBannerText}>
+                {parts.length > 0 && submittedParts.size >= parts.length
+                  ? 'This exam is submitted — you’re viewing your results.'
+                  : 'This exam has closed — you’re viewing your submitted results.'}
+              </Text>
             </View>
             {parts.length === 0 && (
               <View style={styles.emptyBox}>
@@ -362,7 +448,16 @@ export default function ExamTakeScreen() {
               </View>
             )}
             {parts.map((p, pIdx) => (
-              <PartReview key={p.id} part={p} index={pIdx + 1} />
+              <PartReview
+                key={p.id}
+                part={{
+                  ...p,
+                  answers: reviewByPart[p.id]?.answers ?? p.answers,
+                  score: reviewByPart[p.id]?.score ?? null,
+                  submissionStatus: reviewByPart[p.id]?.status ?? null,
+                }}
+                index={pIdx + 1}
+              />
             ))}
           </ScrollView>
         </View>
@@ -434,8 +529,12 @@ export default function ExamTakeScreen() {
                 <Text style={styles.modalTitle}>Exam submitted</Text>
                 {xpAward ? (
                   <View style={styles.xpBox}>
-                    <Text style={styles.xpTotal}>+{xpAward.total} XP</Text>
-                    <Text style={styles.xpSub}>Completion {xpAward.completion} · Accuracy {xpAward.accuracy}</Text>
+                    <Text style={styles.xpTotal}>+{xpAward.total_xp} XP</Text>
+                    <Text style={styles.xpSub}>
+                      Completion {xpAward.completion_xp} · Accuracy {xpAward.accuracy_xp}
+                      {xpAward.on_time_xp ? ` · On time ${xpAward.on_time_xp}` : ''}
+                      {xpAward.accuracy_pending ? ' · essays still grading' : ''}
+                    </Text>
                   </View>
                 ) : (
                   <Text style={styles.modalSub}>All parts submitted. Your results will appear in the Exams tab.</Text>
@@ -550,7 +649,11 @@ export default function ExamTakeScreen() {
             <View style={styles.modalCard}>
               <View style={styles.successIcon}><Ionicons name="checkmark" size={26} color="#fff" /></View>
               <Text style={styles.modalTitle}>Part submitted</Text>
-              <Text style={styles.modalSub}>Nice work. Move on to the next part when you&apos;re ready.</Text>
+              <Text style={styles.modalSub}>
+                {lastPartStatus && ['pending_ai', 'pending_review'].includes(lastPartStatus.status)
+                  ? 'Your essays are being graded — final marks will show in the Exams tab.'
+                  : 'Nice work. Move on to the next part when you’re ready.'}
+              </Text>
               <TouchableOpacity style={styles.modalPrimary} onPress={() => setShowSuccess(false)}><Text style={styles.modalPrimaryText}>Continue</Text></TouchableOpacity>
             </View>
           </View>
@@ -564,8 +667,12 @@ export default function ExamTakeScreen() {
               <Text style={styles.modalTitle}>Exam submitted</Text>
               {xpAward ? (
                 <View style={styles.xpBox}>
-                  <Text style={styles.xpTotal}>+{xpAward.total} XP</Text>
-                  <Text style={styles.xpSub}>Completion {xpAward.completion} · Accuracy {xpAward.accuracy}</Text>
+                  <Text style={styles.xpTotal}>+{xpAward.total_xp} XP</Text>
+                  <Text style={styles.xpSub}>
+                    Completion {xpAward.completion_xp} · Accuracy {xpAward.accuracy_xp}
+                    {xpAward.on_time_xp ? ` · On time ${xpAward.on_time_xp}` : ''}
+                    {xpAward.accuracy_pending ? ' · essays still grading' : ''}
+                  </Text>
                 </View>
               ) : (
                 <Text style={styles.modalSub}>All parts submitted. Your results will appear in the Exams tab.</Text>
@@ -666,19 +773,26 @@ function PartReview({ part, index }: { part: Part; index: number }) {
     part.questions.some((q) => q.feedback) ||
     Object.keys(answers).length > 0 ||
     part.questions.some((q) => q.options?.some((o) => o.is_correct) || q.correct_answer);
+  const gradingPending = part.submissionStatus === 'pending_ai' || part.submissionStatus === 'pending_review';
 
   return (
     <View style={styles.reviewPart}>
       <View style={styles.reviewPartHead}>
         <View style={[styles.partNum, partSubmitted(part) ? styles.partNumDone : {}]}><Text style={[styles.partNumText, !partSubmitted(part) && { color: '#D96A3E' }]}>{index}</Text></View>
-        <View style={{ flex: 1 }}><Text style={styles.partTitle}>{part.title}</Text><Text style={styles.partMeta}>{part.points} pts</Text></View>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.partTitle}>{part.title}</Text>
+          <Text style={styles.partMeta}>
+            {part.score != null ? `Score ${part.score} / ${part.points}` : `${part.points} pts`}
+            {gradingPending ? ' · essays still grading' : ''}
+          </Text>
+        </View>
         <View style={partSubmitted(part) ? styles.doneBadge : styles.lockBadge}>
           <Text style={partSubmitted(part) ? styles.doneBadgeText : styles.lockBadgeText}>{partSubmitted(part) ? 'Submitted' : 'Not submitted'}</Text>
         </View>
       </View>
-      {!hasReview && (
+      {!hasReview && partSubmitted(part) && part.score == null && (
         <Text style={{ fontSize: 12, color: '#6B7280', marginTop: 8, lineHeight: 16 }}>
-          Per-question detail for this part isn&apos;t included in the API response.
+          Per-question detail isn&apos;t available yet (grading may still be in progress).
         </Text>
       )}
       {part.questions.map((q, i) => {

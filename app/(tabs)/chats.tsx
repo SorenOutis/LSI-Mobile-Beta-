@@ -23,7 +23,7 @@ export default function ChatsScreen() {
     setLoading(true);
     setError(null);
     try {
-      const r: any = await api.get('/chats');
+      const r: any = await api.get('/mobile/chats');
       const d = r.data ?? r;
       setSessions(Array.isArray(d) ? d : d.data ?? []);
     } catch (e) {
@@ -43,7 +43,7 @@ export default function ChatsScreen() {
     setSendError(null);
     setMessages([]);
     try {
-      const r: any = await api.get(`/chats/${sess.id ?? sess.public_id}/messages`);
+      const r: any = await api.get(`/mobile/chats/${sess.id ?? sess.public_id}/messages`);
       const d = r.data ?? r;
       setMessages(Array.isArray(d) ? d : d.data ?? []);
     } catch {
@@ -58,9 +58,10 @@ export default function ChatsScreen() {
     setSending(true);
     setSendError(null);
     try {
-      const r: any = await api.post(`/chats/${sess.id ?? sess.public_id}/messages`, { content });
-      const msg = r?.data ?? r;
-      setMessages((prev) => [...prev, msg && typeof msg === 'object' ? msg : { content }]);
+      // The backend persists both turns and answers with the reply text.
+      const r: any = await api.post(`/mobile/chats/${sess.id ?? sess.public_id}/messages`, { message: content });
+      const reply = typeof r?.response === 'string' ? r.response : content;
+      setMessages((prev) => [...prev, { role: 'user', content }, { role: 'assistant', content: reply }]);
       setInput('');
     } catch (e) {
       setSendError(errorMessage(e));

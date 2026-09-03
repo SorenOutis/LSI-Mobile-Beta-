@@ -1,68 +1,39 @@
-import { Link } from 'expo-router';
-import { useState } from 'react';
-import { Alert, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import * as Linking from 'expo-linking';
+import { useRouter } from 'expo-router';
+import { ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { api, errorMessage } from '@/lib/api';
+import { webLink } from '@/lib/api';
 
-const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
+/**
+ * Password resets are an e-mail flow on the LUA V6 web app (the reset link is
+ * one-time and single-use). This screen points there instead of faking a
+ * local reset.
+ */
 export default function ForgotPasswordScreen() {
-  const [email, setEmail] = useState('');
-  const [processing, setProcessing] = useState(false);
-  const [status, setStatus] = useState<string | null>(null);
-
-  const onSubmit = async () => {
-    if (!EMAIL_PATTERN.test(email.trim())) {
-      Alert.alert('Invalid email', 'Please enter a valid email address.');
-      return;
-    }
-    setProcessing(true);
-    try {
-      // Fortify-style endpoint on the LUA V6 backend.
-      await api.post('/auth/forgot-password', { email: email.trim() });
-      setStatus('We have emailed your password reset link if an account exists for that address.');
-    } catch (e) {
-      Alert.alert('Could not send reset link', errorMessage(e));
-    } finally {
-      setProcessing(false);
-    }
-  };
+  const router = useRouter();
 
   return (
     <SafeAreaView style={styles.safe} edges={['top', 'bottom']}>
-      <ScrollView style={styles.container} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
+      <ScrollView style={styles.container} contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
         <View style={styles.branding}>
-          <View style={styles.logoBox}>
-            <Text style={styles.logoText}>LSI</Text>
-          </View>
+          <View style={styles.logoBox}><Text style={styles.logoText}>LSI</Text></View>
           <Text style={styles.logoSub}>KOAMISHIN</Text>
         </View>
 
         <View style={styles.card}>
-          <View style={styles.header}>
-            <Text style={styles.title}>Forgot password</Text>
-            <Text style={styles.subtitle}>Enter your email to receive a password reset link</Text>
-          </View>
+          <Text style={styles.title}>Reset on the web</Text>
+          <Text style={styles.subtitle}>
+            Forgot your password? Open the web app and use “Forgot your password?” — a reset
+            link is sent to your account e-mail. Then log in here with the new password.
+          </Text>
 
-          {status && <View style={styles.statusBox}><Text style={styles.statusText}>{status}</Text></View>}
-
-          <View style={styles.field}>
-            <Text style={styles.label}>Email address</Text>
-            <View style={styles.inputWrap}>
-              <TextInput value={email} onChangeText={setEmail} placeholder="you@example.com" placeholderTextColor="#9AA0A6" keyboardType="email-address" autoCapitalize="none" autoComplete="email" style={styles.input} />
-            </View>
-          </View>
-
-          <TouchableOpacity style={[styles.primaryBtn, processing && { opacity: 0.7 }]} onPress={onSubmit} disabled={processing}>
-            <Text style={styles.primaryBtnText}>{processing ? 'Sending link...' : 'Email password reset link'}</Text>
+          <TouchableOpacity style={styles.primaryBtn} onPress={() => Linking.openURL(webLink('/forgot-password'))}>
+            <Text style={styles.primaryBtnText}>Open the web reset page</Text>
           </TouchableOpacity>
 
-          <View style={styles.footerRow}>
-            <Text style={styles.footerMuted}>Or, return to </Text>
-            <Link href="/(auth)/login" asChild>
-              <TouchableOpacity><Text style={styles.footerLink}>log in</Text></TouchableOpacity>
-            </Link>
-          </View>
+          <TouchableOpacity onPress={() => router.back()}>
+            <Text style={styles.switchLink}>Back to log in</Text>
+          </TouchableOpacity>
         </View>
       </ScrollView>
     </SafeAreaView>
@@ -77,19 +48,10 @@ const styles = StyleSheet.create({
   logoBox: { width: 56, height: 56, borderRadius: 16, backgroundColor: '#fff', borderWidth: 1, borderColor: '#EAE5DE', alignItems: 'center', justifyContent: 'center' },
   logoText: { fontSize: 18, fontWeight: '900', color: '#1A1E22' },
   logoSub: { fontSize: 11, letterSpacing: 3, color: '#6B7280', fontWeight: '600' },
-  card: { backgroundColor: '#fff', borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 16, padding: 20, gap: 16 },
-  header: { alignItems: 'center', gap: 6 },
-  title: { fontSize: 20, fontWeight: '800', color: '#1A1E22' },
-  subtitle: { fontSize: 13, color: '#6B7280', textAlign: 'center' },
-  statusBox: { backgroundColor: '#ECFDF5', borderWidth: 1, borderColor: '#A7F3D0', borderRadius: 10, padding: 12 },
-  statusText: { fontSize: 12, color: '#065F46', textAlign: 'center', fontWeight: '600' },
-  field: { gap: 6 },
-  label: { fontSize: 12, fontWeight: '700', color: '#1A1E22' },
-  inputWrap: { flexDirection: 'row', alignItems: 'center', borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 10, paddingHorizontal: 12, backgroundColor: '#FFFEFC' },
-  input: { flex: 1, paddingVertical: 12, fontSize: 14, color: '#1A1E22' },
-  primaryBtn: { backgroundColor: '#15181E', borderRadius: 10, paddingVertical: 14, alignItems: 'center' },
+  card: { backgroundColor: '#fff', borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 16, padding: 20, gap: 16, alignItems: 'center' },
+  title: { fontSize: 20, fontWeight: '800', color: '#1A1E22', textAlign: 'center' },
+  subtitle: { fontSize: 13, color: '#6B7280', textAlign: 'center', lineHeight: 19 },
+  primaryBtn: { backgroundColor: '#15181E', borderRadius: 10, paddingVertical: 14, alignItems: 'center', width: '100%' },
   primaryBtnText: { color: '#fff', fontWeight: '800', fontSize: 14 },
-  footerRow: { flexDirection: 'row', justifyContent: 'center', gap: 4 },
-  footerMuted: { fontSize: 12, color: '#6B7280' },
-  footerLink: { fontSize: 12, fontWeight: '700', color: '#1A1E22', textDecorationLine: 'underline' },
+  switchLink: { fontSize: 13, color: '#1A1E22', fontWeight: '700', textDecorationLine: 'underline' },
 });

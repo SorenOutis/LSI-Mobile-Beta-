@@ -33,8 +33,8 @@ export default function ProfileSettings() {
     }
     setSaving(true);
     try {
-      // PUT /user updates the profile on the LUA V6 backend.
-      await api.put('/user', {
+      // PATCH /mobile/me updates the profile on the live LUA V6 backend.
+      await api.patch('/mobile/me', {
         first_name: f,
         last_name: l,
         middle_name: middle.trim() || null,

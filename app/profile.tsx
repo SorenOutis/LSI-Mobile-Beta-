@@ -15,7 +15,7 @@ export default function ProfileScreen() {
   useEffect(() => {
     if (!token) return;
     setLoading(true);
-    api.get<any>('/user').then((r) => setProfile(r.data ?? r)).catch(() => setProfile(null)).finally(() => setLoading(false));
+    api.get<any>('/mobile/me').then((r) => setProfile(r.user ?? r.data ?? r)).catch(() => setProfile(null)).finally(() => setLoading(false));
   }, [token, user]);
   const p = profile ?? user;
   return (

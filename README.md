@@ -15,19 +15,26 @@ Press `i` / `a` for the iOS simulator / Android emulator, or scan the QR code wi
 
 ## Connecting to LUA V6
 
-The app talks to the LUA V6 backend (`/api` routes on the backend's origin).
+The app talks to the **live** LUA V6 deployment by default:
 
-| Where you're running | `EXPO_PUBLIC_API_URL` |
-|---|---|
-| Web (dev) | `http://localhost:9000` |
-| Android emulator | `http://10.0.2.2:9000` |
-| iOS simulator | `http://localhost:9000` |
-| Physical device (same Wi-Fi) | `http://<your-machine-lan-ip>:9000` |
-| Production / release builds | `https://<your-domain>` (HTTPS is required for release) |
+```
+https://lsi.koamishin.com
+```
 
-Copy `.env.example` to `.env` and set the value (`.env` is git-ignored). If you leave it unset, the app auto-detects the dev machine: Android emulator → `10.0.2.2`, physical device → your LAN IP (from the Expo `hostUri`), web → `localhost` — all on port `9000`.
+All endpoints are the mobile JSON API under `/api/mobile/*` (token auth issued by
+`POST /api/mobile/auth/login`). No local or LAN backend is required.
 
-> If requests fail, look for the orange "Can't reach the LUA V6 server" banner at the top of the tabs — it means the network request never reached the backend (wrong URL, different Wi-Fi, backend not running, or HTTPS mixed-content on web).
+### Overriding the base URL
+
+Set `EXPO_PUBLIC_API_URL` to point the app somewhere else (a staging deploy, or a
+local backend while developing the API itself). Copy `.env.example` to `.env`
+and edit it (`.env` is git-ignored). Leave it unset and the live URL above is used.
+
+> If requests fail, look for the orange "Can't reach the LUA V6 server" banner at
+> the top of the tabs — it means the network request never reached the backend
+> (the app is offline, the deploy is down, or a custom URL is wrong).
+
+> Release builds must point `EXPO_PUBLIC_API_URL` at an `https://` origin.
 
 ## Scripts
 
@@ -46,7 +53,7 @@ Type-checking: `npx tsc --noEmit`.
 app/
   _layout.tsx            Root stack + auth gate (token → tabs, else welcome) + splash
   index.tsx              Welcome / marketing screen (pre-login)
-  (auth)/                Login, register, 2FA, forgot/reset password, verify email
+  (auth)/                Login + 2FA; register / forgot password link to the web app
   (tabs)/                Home, Exams, Agenda, Tasks, Grades, Chats
   exams/[id].tsx         Real exam take flow: parts, timer, autosave, submit, review
   courses/               Course list / detail / lesson (quiz)
@@ -61,12 +68,17 @@ lib/
                          errorMessage(), connection status hook, webLink()
   format.ts              Date/time + initials helpers (local-time aware)
 context/
-  AuthContext.tsx        Session (token in SecureStore), login/register/logout
+  AuthContext.tsx        Session (token in SecureStore), login + 2FA, logout
 ```
 
-### API contract assumptions
+### API contract
 
-The client calls the LUA V6 backend under `/api`. Auth uses Bearer tokens (`/auth/login`, `/auth/register`, `/auth/logout`, `GET /user`). Where a route was not yet confirmed, the endpoint is a named constant near the top of the screen file (e.g. `ENDPOINTS` in `app/exams/[id].tsx`) — adjust there if your backend differs. Screens that depend on a not-yet-available contract show an honest error state with an "Open in web app" link instead of fake data.
+The client calls the LUA V6 **mobile JSON API** (`/api/mobile/*`) with Bearer
+tokens issued by `POST /api/mobile/auth/login` (two-leg flow: email+password →
+`requires_two_factor` → code). Every screen's endpoints and payload shapes match
+the routes in the backend's `routes/api.php`. Where an action can't be done from
+the mobile client yet (e.g. assignment file uploads), the screen links to the web
+app instead of faking it.
 
 ## Notes
 

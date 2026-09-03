@@ -3,8 +3,8 @@ import { Link, useRouter } from 'expo-router';
 import { useState } from 'react';
 import { Alert, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useAuth } from '@/context/AuthContext';
-import { errorMessage } from '@/lib/api';
+import { useAuth, TWO_FACTOR_REQUIRED } from '@/context/AuthContext';
+import { ApiError, errorMessage } from '@/lib/api';
 
 export default function LoginScreen() {
   const router = useRouter();
@@ -24,6 +24,12 @@ export default function LoginScreen() {
       await login(email.trim(), password);
       router.replace('/(tabs)' as any);
     } catch (e) {
+      // Password accepted — the account has 2FA enabled. Continue the same
+      // login with the code (the backend re-verifies both in one call).
+      if (e instanceof ApiError && e.code === TWO_FACTOR_REQUIRED) {
+        router.replace('/(auth)/two-factor' as any);
+        return;
+      }
       Alert.alert('Login failed', errorMessage(e));
     } finally {
       setProcessing(false);

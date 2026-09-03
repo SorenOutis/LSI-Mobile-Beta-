@@ -16,15 +16,16 @@ export default function LessonScreen() {
   const [data, setData] = useState<any>(null);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [answer, setAnswer] = useState<number | null>(null);
+  const [answers, setAnswers] = useState<(number | null)[]>([]);
   const [completing, setCompleting] = useState(false);
+  const [quizResult, setQuizResult] = useState<any>(null);
 
   const load = useCallback(async () => {
     if (!course || !lesson) return;
     setLoaded(false);
     setError(null);
     try {
-      const r: any = await api.get(`/courses/${course}/lessons/${lesson}`);
+      const r: any = await api.get(`/mobile/courses/${course}/lessons/${lesson}`);
       setData(r.data ?? r);
     } catch (e) {
       setError(errorMessage(e));
@@ -36,6 +37,13 @@ export default function LessonScreen() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // Reset per-question selections whenever the loaded quiz changes size.
+  const questionsLength = Array.isArray(data?.quiz?.questions) ? (data.quiz.questions as any[]).length : 0;
+  useEffect(() => {
+    setAnswers(Array(questionsLength).fill(null));
+    setQuizResult(null);
+  }, [questionsLength]);
 
   if (!course || !lesson) {
     return (
@@ -75,29 +83,41 @@ export default function LessonScreen() {
     );
   }
 
-  const quiz = data?.quiz ?? (data?.question ? { question: data.question, options: data.options, correct_index: data.correct_index } : null);
-  const options: string[] = (quiz?.options ?? []).map((o: any) => (typeof o === 'string' ? o : o.text));
-  const correct: number = Number(quiz?.correct_index ?? quiz?.correct_option ?? -1);
-  const content: string = data?.content ?? data?.body ?? data?.text ?? '';
-  const title: string = data?.title ?? data?.name ?? 'Lesson';
+  // Live backend payload: { course, lesson: {title, content, ...},
+  // quiz: {questions, passScore, allowedAttempts}, userProgress, ... }
+  const lessonData = data?.lesson ?? {};
+  const quiz: any = data?.quiz ?? null;
+  const questions: any[] = Array.isArray(quiz?.questions) ? quiz.questions : [];
+  const content: string = lessonData.content ?? data?.content ?? '';
+  const title: string = lessonData.title ?? data?.title ?? 'Lesson';
+  const userProgress: any = data?.userProgress;
 
   const complete = async () => {
     if (completing) return;
+    if (quizResult) {
+      router.back();
+      return;
+    }
+    if (questions.length === 0) {
+      router.back();
+      return;
+    }
+    if (answers.some((a) => a === null || a === undefined)) {
+      Alert.alert('Answer all questions', 'Pick an answer for every quiz question first.');
+      return;
+    }
     setCompleting(true);
     try {
-      await api.post(`/courses/${course}/lessons/${lesson}/complete`, {
-        answer: quiz ? answer : undefined,
+      const r: any = await api.post(`/mobile/courses/${course}/lessons/${lesson}/quiz`, {
+        answers: questions.map((_, i) => ({ questionIndex: i, selectedOptionIndex: answers[i] ?? 0 })),
       });
+      setQuizResult(r?.quizResult ?? null);
     } catch (e) {
-      // Completion is best-effort: the lesson was read; report but still go back.
-      Alert.alert('Could not mark complete', errorMessage(e));
+      Alert.alert('Quiz submission failed', errorMessage(e));
     } finally {
       setCompleting(false);
-      router.back();
     }
   };
-
-  const showResult = answer !== null;
 
   return (
     <SafeAreaView style={styles.safe} edges={['top']}>
@@ -106,29 +126,43 @@ export default function LessonScreen() {
         <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
           {!!content && <Text style={styles.contentText}>{content}</Text>}
 
-          {quiz ? (
+          {questions.length > 0 ? (
             <>
-              <Text style={styles.q}>{quiz.question}</Text>
-              <Text style={styles.qHint}>Choose one answer{data?.xp != null ? ` · earn ${data.xp} XP` : ''}</Text>
-              {options.map((opt, i) => {
-                const isSelected = answer === i;
-                const isCorrect = i === correct;
+              <Text style={styles.qHint}>
+                Lesson quiz · {questions.length} question{questions.length === 1 ? '' : 's'}
+                {quiz?.passScore != null ? ` · pass at ${quiz.passScore}%` : ''}
+                {userProgress && userProgress.attempts > 0 ? ` · attempt ${userProgress.attempts}` : ''}
+              </Text>
+              {questions.map((q: any, qi: number) => {
+                const opts: string[] = (q.options ?? []).map((o: any) => (typeof o === 'string' ? o : o.text ?? ''));
                 return (
-                  <TouchableOpacity
-                    key={i}
-                    onPress={() => setAnswer(i)}
-                    style={[styles.opt, isSelected && styles.optSelected, showResult && isCorrect && styles.optCorrect, showResult && isSelected && !isCorrect && styles.optWrong]}
-                  >
-                    <View style={[styles.radio, isSelected && styles.radioSel]}>{isSelected && <View style={styles.radioDot} />}</View>
-                    <Text style={styles.optText}>{opt}</Text>
-                    {showResult && isCorrect && <Ionicons name="checkmark-circle" size={18} color="#10B981" />}
-                  </TouchableOpacity>
+                  <View key={qi} style={{ gap: 8 }}>
+                    <Text style={styles.q}>{qi + 1}. {q.text}</Text>
+                    {opts.map((opt: string, oi: number) => {
+                      const isSelected = answers[qi] === oi;
+                      return (
+                        <TouchableOpacity
+                          key={oi}
+                          onPress={() => {
+                            if (quizResult) return;
+                            setAnswers((prev) => prev.map((a, i) => (i === qi ? oi : a)));
+                          }}
+                          style={[styles.opt, isSelected && styles.optSelected]}
+                        >
+                          <View style={[styles.radio, isSelected && styles.radioSel]}>{isSelected && <View style={styles.radioDot} />}</View>
+                          <Text style={styles.optText}>{opt}</Text>
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </View>
                 );
               })}
-              {showResult && correct >= 0 && (
-                <View style={[styles.feedback, answer === correct ? { backgroundColor: '#ECFDF5', borderColor: '#A7F3D0' } : { backgroundColor: '#FFF1F2', borderColor: '#FECDD3' }]}>
-                  <Text style={[styles.feedbackText, { color: answer === correct ? '#065F46' : '#9F1239' }]}>
-                    {answer === correct ? 'Correct! Great job.' : `Not quite — the correct answer is “${options[correct] ?? '?'}”.`}
+              {quizResult && (
+                <View style={[styles.feedback, quizResult.passed ? { backgroundColor: '#ECFDF5', borderColor: '#A7F3D0' } : { backgroundColor: '#FFF1F2', borderColor: '#FECDD3' }]}>
+                  <Text style={[styles.feedbackText, { color: quizResult.passed ? '#065F46' : '#9F1239' }]}>
+                    {quizResult.passed
+                      ? `Passed — ${quizResult.correctAnswers}/${quizResult.totalQuestions} correct. Lesson complete.`
+                      : `Score ${quizResult.score}% (${quizResult.correctAnswers}/${quizResult.totalQuestions} correct) — you need ${quizResult.passScore}% to pass.`}
                   </Text>
                 </View>
               )}
@@ -136,13 +170,13 @@ export default function LessonScreen() {
           ) : (
             <View style={styles.emptyBox}>
               <Text style={styles.emptyText}>
-                This lesson has no interactive quiz in the API response{content ? '' : ' — its content is available in the web app'}.
+                This lesson has no quiz{content ? '' : ' — its full content is available in the web app'}.
               </Text>
             </View>
           )}
 
           <TouchableOpacity style={[styles.primaryBtn, completing && { opacity: 0.7 }]} disabled={completing} onPress={complete}>
-            <Text style={styles.primaryText}>{completing ? 'Saving progress...' : quiz ? 'Submit & continue' : 'Continue'}</Text>
+            <Text style={styles.primaryText}>{completing ? 'Submitting...' : quizResult ? 'Continue' : questions.length > 0 ? 'Submit quiz' : 'Continue'}</Text>
           </TouchableOpacity>
         </ScrollView>
       </View>

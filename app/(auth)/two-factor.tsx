@@ -2,10 +2,18 @@ import { useRouter } from 'expo-router';
 import { useState } from 'react';
 import { Alert, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { api, errorMessage } from '@/lib/api';
+import { useAuth } from '@/context/AuthContext';
+import { errorMessage } from '@/lib/api';
 
+/**
+ * Second leg of a 2FA sign-in. The login screen stores the credentials in
+ * AuthContext when the live backend answers {requires_two_factor: true};
+ * submitting a code (TOTP or recovery) completes the same login and issues
+ * the token.
+ */
 export default function TwoFactorScreen() {
   const router = useRouter();
+  const { pendingTwoFactor, completeTwoFactor, cancelTwoFactor } = useAuth();
   const [showRecovery, setShowRecovery] = useState(false);
   const [code, setCode] = useState('');
   const [recoveryCode, setRecoveryCode] = useState('');
@@ -23,11 +31,7 @@ export default function TwoFactorScreen() {
     }
     setProcessing(true);
     try {
-      // Two-factor challenge on the LUA V6 backend (Fortify-style payload).
-      await api.post(
-        '/auth/two-factor/verify',
-        showRecovery ? { recovery_code: val } : { code: val }
-      );
+      await completeTwoFactor(val);
       router.replace('/(tabs)' as any);
     } catch (e) {
       Alert.alert('Verification failed', errorMessage(e));
@@ -37,6 +41,26 @@ export default function TwoFactorScreen() {
       setProcessing(false);
     }
   };
+
+  const goBack = () => {
+    cancelTwoFactor();
+    router.back();
+  };
+
+  if (!pendingTwoFactor) {
+    // Navigated here directly — no sign-in in progress.
+    return (
+      <SafeAreaView style={styles.safe} edges={['top', 'bottom']}>
+        <View style={styles.content}>
+          <Text style={styles.title}>Nothing to verify</Text>
+          <Text style={styles.subtitle}>Start a sign-in first.</Text>
+          <TouchableOpacity style={styles.primaryBtn} onPress={goBack}>
+            <Text style={styles.primaryBtnText}>Back to log in</Text>
+          </TouchableOpacity>
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.safe} edges={['top', 'bottom']}>

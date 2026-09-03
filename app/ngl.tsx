@@ -19,7 +19,7 @@ export default function NglScreen() {
     if (!token) return;
     setLoading(true);
     try {
-      const r: any = await api.get('/ngl');
+      const r: any = await api.get('/mobile/ngl');
       const d = r.data ?? r;
       setMsgs(Array.isArray(d) ? d : d.data ?? []);
     } catch {
@@ -37,11 +37,12 @@ export default function NglScreen() {
     const content = newMsg.trim();
     if (!content) return;
     try {
-      const r: any = await api.post('/ngl', { content });
-      const created = r?.data ?? r;
-      setMsgs((prev) => [created && typeof created === 'object' ? created : { id: Date.now(), content }, ...(prev ?? [])]);
+      // The live backend queues the message for approval — it shows up in the
+      // feed only once a teacher approves it, so don't pretend it's posted.
+      await api.post('/mobile/ngl', { content });
       setNewMsg('');
       setShowModal(false);
+      Alert.alert('Sent', 'Your message was sent for approval. It will appear in the feed once approved.');
     } catch (e) {
       Alert.alert('Could not post', errorMessage(e));
     }
@@ -49,8 +50,9 @@ export default function NglScreen() {
 
   const toggleLike = async (id: number) => {
     try {
-      await api.post(`/ngl/${id}/like`);
-      setMsgs((prev) => (prev ? prev.map((m) => (m.id === id ? { ...m, likes_count: (m.likes_count ?? m.likes ?? 0) + 1 } : m)) : prev));
+      const r: any = await api.post(`/mobile/ngl/${id}/like`);
+      const liked = r?.liked ?? true;
+      setMsgs((prev) => (prev ? prev.map((m) => (m.id === id ? { ...m, likes_count: Math.max(0, (m.likes_count ?? m.likes ?? 0) + (liked ? 1 : -1)) } : m)) : prev));
     } catch (e) {
       Alert.alert('Could not like', errorMessage(e));
     }

@@ -27,8 +27,8 @@ export default function PasswordSettings() {
     }
     setSaving(true);
     try {
-      // Change-password endpoint on the LUA V6 backend (Fortify-style payload).
-      await api.put('/auth/password', {
+      // Change-password endpoint on the live LUA V6 backend.
+      await api.put('/mobile/password', {
         current_password: current,
         password: next,
         password_confirmation: confirm,
