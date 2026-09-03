@@ -4,6 +4,7 @@ import { useState, useMemo } from 'react';
 import { Alert, Modal, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useAuth } from '@/context/AuthContext';
+import { errorMessage } from '@/lib/api';
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -81,9 +82,8 @@ export default function RegisterScreen() {
         terms: form.terms ? '1' : '0',
       });
       router.replace('/(tabs)' as any);
-    } catch (e: any) {
-      const msg = e?.response?.data?.message || e?.response?.data?.errors?.email?.[0] || 'Registration failed.';
-      Alert.alert('Error', msg);
+    } catch (e) {
+      Alert.alert('Registration failed', errorMessage(e));
     } finally {
       setProcessing(false);
     }
@@ -236,7 +236,7 @@ export default function RegisterScreen() {
                 <TouchableOpacity onPress={() => setShowTermsModal(true)}><Text style={styles.termsLink}>Terms and Conditions</Text></TouchableOpacity>
               </TouchableOpacity>
               {touched.terms && !termsValid && <Text style={styles.error}>You must accept the Terms.</Text>}
-              <Text style={styles.hintCenter}>Clicking "Create account" will finalize your registration.</Text>
+              <Text style={styles.hintCenter}>Selecting Create account will finalize your registration.</Text>
             </View>
           )}
 

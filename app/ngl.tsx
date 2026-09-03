@@ -1,10 +1,9 @@
-// @ts-nocheck
 import { Ionicons } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
-import { useEffect, useState } from 'react';
-import { ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { useCallback, useEffect, useState } from 'react';
+import { Alert, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { api } from '@/lib/api';
+import { api, errorMessage } from '@/lib/api';
 import { useAuth } from '@/context/AuthContext';
 import { PageSkeleton } from '@/components/PageSkeleton';
 
@@ -16,27 +15,45 @@ export default function NglScreen() {
   const [newMsg, setNewMsg] = useState('');
   const [showModal, setShowModal] = useState(false);
 
-  useEffect(() => {
+  const load = useCallback(async () => {
     if (!token) return;
     setLoading(true);
-    api.get('/ngl').then(r => setMsgs(r.data.data ?? r.data ?? [])).catch(() => setMsgs([])).finally(() => setLoading(false));
+    try {
+      const r: any = await api.get('/ngl');
+      const d = r.data ?? r;
+      setMsgs(Array.isArray(d) ? d : d.data ?? []);
+    } catch {
+      setMsgs([]);
+    } finally {
+      setLoading(false);
+    }
   }, [token]);
 
+  useEffect(() => {
+    load();
+  }, [load]);
+
   const post = async () => {
-    if (!newMsg.trim()) return;
+    const content = newMsg.trim();
+    if (!content) return;
     try {
-      const r = await api.post('/ngl', { content: newMsg });
-      setMsgs([r.data, ...(msgs ?? [])]);
+      const r: any = await api.post('/ngl', { content });
+      const created = r?.data ?? r;
+      setMsgs((prev) => [created && typeof created === 'object' ? created : { id: Date.now(), content }, ...(prev ?? [])]);
       setNewMsg('');
       setShowModal(false);
-    } catch {}
+    } catch (e) {
+      Alert.alert('Could not post', errorMessage(e));
+    }
   };
 
   const toggleLike = async (id: number) => {
     try {
       await api.post(`/ngl/${id}/like`);
-      setMsgs((prev) => prev ? prev.map(m => m.id === id ? { ...m, likes_count: (m.likes_count ?? m.likes ?? 0) + 1 } : m) : prev);
-    } catch {}
+      setMsgs((prev) => (prev ? prev.map((m) => (m.id === id ? { ...m, likes_count: (m.likes_count ?? m.likes ?? 0) + 1 } : m)) : prev));
+    } catch (e) {
+      Alert.alert('Could not like', errorMessage(e));
+    }
   };
 
   return (

@@ -1,21 +1,35 @@
-// @ts-nocheck
 import { Ionicons } from '@expo/vector-icons';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Platform, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { api } from '@/lib/api';
+import { api, errorMessage } from '@/lib/api';
 import { useAuth } from '@/context/AuthContext';
 import { PageSkeleton } from '@/components/PageSkeleton';
 
 export default function GradesScreen() {
   const { token } = useAuth();
   const [data, setData] = useState<any>(null);
-  const [loading, setLoading] = useState(false);
-  useEffect(() => {
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
     if (!token) return;
     setLoading(true);
-    api.get('/grades').then(r => setData((r.data ?? r))).catch(() => setData({ subjectGrades: [] })).finally(() => setLoading(false));
+    setError(null);
+    try {
+      const r: any = await api.get('/grades');
+      setData(r.data ?? r);
+    } catch (e) {
+      setError(errorMessage(e));
+      setData(null);
+    } finally {
+      setLoading(false);
+    }
   }, [token]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
   const subjects: any[] = data?.subjectGrades ?? data?.grades ?? [];
   const overall = data?.overall ?? null;
 
@@ -24,10 +38,17 @@ export default function GradesScreen() {
       <View style={styles.webWrap}>
         <View style={styles.header}>
           <Text style={styles.headerTitle}>Grades</Text>
-          <TouchableOpacity style={styles.filterBtn}><Ionicons name="filter" size={20} color="#1A1E22" /></TouchableOpacity>
         </View>
         <ScrollView style={styles.container} contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
-          {loading ? <PageSkeleton count={4} /> : (
+          {loading ? (
+            <PageSkeleton count={4} />
+          ) : error ? (
+            <View style={{ alignItems: 'center', gap: 8, paddingVertical: 32 }}>
+              <Ionicons name="cloud-offline-outline" size={32} color="#8A8A8A" />
+              <Text style={{ fontSize: 12, color: '#6B7280' }}>{error}</Text>
+              <TouchableOpacity style={styles.retryBtn} onPress={load}><Text style={styles.retryText}>Try again</Text></TouchableOpacity>
+            </View>
+          ) : (
             <>
               {overall !== null && (
                 <View style={styles.overallCard}>
@@ -42,15 +63,14 @@ export default function GradesScreen() {
                 <View style={{ alignItems: 'center', paddingVertical: 32 }}><Text style={{ fontWeight: '700' }}>No grades yet</Text><Text style={{ color: '#6B7280', fontSize: 12 }}>Your grades will appear here.</Text></View>
               ) : (
                 subjects.map((s: any) => (
-                  <TouchableOpacity key={s.subject ?? s.name} style={styles.subjectCard}>
+                  <View key={s.subject ?? s.name} style={styles.subjectCard}>
                     <View style={styles.subjectIcon}><Ionicons name="calculator-outline" size={24} color="#3A7D5C" /></View>
                     <View style={{ flex: 1 }}>
                       <Text style={styles.subjectTitle}>{s.subject ?? s.name}</Text>
                       <Text style={styles.trendText}>{s.section?.name ?? ''}</Text>
                     </View>
                     <Text style={styles.pct}>{s.currentAverage ? `${Math.round(s.currentAverage)}%` : s.grade ?? '--'}</Text>
-                    <Ionicons name="chevron-forward" size={18} color="#1A1E22" />
-                  </TouchableOpacity>
+                  </View>
                 ))
               )}
             </>
@@ -61,11 +81,12 @@ export default function GradesScreen() {
   );
 }
 const styles = StyleSheet.create({
+  retryBtn: { backgroundColor: '#1A1E22', borderRadius: 10, paddingHorizontal: 20, paddingVertical: 10, marginTop: 4 },
+  retryText: { color: '#fff', fontSize: 12, fontWeight: '700' },
   safe: { flex: 1, backgroundColor: '#FDFBF6' },
   webWrap: { flex: 1, width: '100%', maxWidth: 480, alignSelf: 'center' },
   header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 14, paddingVertical: 12, backgroundColor: '#FDFBF6' },
   headerTitle: { fontSize: 22, fontWeight: '900', color: '#1A1E22' },
-  filterBtn: { width: 38, height: 38, borderRadius: 10, borderWidth: 1, borderColor: '#EAE5DE', backgroundColor: '#fff', alignItems: 'center', justifyContent: 'center' },
   container: { flex: 1, backgroundColor: '#FDFBF6' },
   content: { paddingHorizontal: 14, paddingBottom: Platform.OS === 'web' ? 90 : 16, gap: 10 },
   overallCard: { backgroundColor: '#fff', borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 14, padding: 16 },

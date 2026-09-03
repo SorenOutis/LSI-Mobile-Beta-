@@ -11,6 +11,25 @@ export function GlobalLoader({ minDisplayMs = 600 }: { minDisplayMs?: number }) 
   const shownAt = useRef<number>(0);
   const progressDone = useRef(false);
 
+  // Read through refs inside animation callbacks so the effects below can be
+  // keyed narrowly without restarting in-flight animations.
+  const pendingHideRef = useRef(pendingHide);
+  pendingHideRef.current = pendingHide;
+
+  const tryExit = () => {
+    if (!(progressDone.current && pendingHideRef.current)) return;
+    const elapsed = Date.now() - shownAt.current;
+    const wait = Math.max(0, minDisplayMs - elapsed);
+    setTimeout(() => {
+      Animated.timing(opacity, { toValue: 0, duration: 300, useNativeDriver: true }).start(() => {
+        setShow(false);
+        hide();
+      });
+    }, wait);
+  };
+  const tryExitRef = useRef(tryExit);
+  tryExitRef.current = tryExit;
+
   useEffect(() => {
     if (isVisible) {
       setShow(true);
@@ -20,15 +39,15 @@ export function GlobalLoader({ minDisplayMs = 600 }: { minDisplayMs?: number }) 
       shownAt.current = Date.now();
       Animated.timing(opacity, { toValue: 1, duration: 300, easing: Easing.out(Easing.quad), useNativeDriver: true }).start();
       Animated.timing(progressAnim, {
-        toValue: pendingHide ? 100 : 95,
+        toValue: pendingHideRef.current ? 100 : 95,
         duration: 2000,
         easing: Easing.out(Easing.quad),
         useNativeDriver: false,
       }).start(({ finished }) => {
-        if (finished && pendingHide) {
+        if (finished) {
           setProgress(100);
           progressDone.current = true;
-          tryExit();
+          tryExitRef.current();
         }
       });
     } else if (show) {
@@ -37,12 +56,15 @@ export function GlobalLoader({ minDisplayMs = 600 }: { minDisplayMs?: number }) 
         hide();
       });
     }
+    // Keyed on visibility only on purpose: `show`/`hide` are stable and the
+    // animation must not restart when unrelated state changes mid-flight.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isVisible]);
 
   useEffect(() => {
     const id = progressAnim.addListener(({ value }) => setProgress(Math.floor(value)));
     return () => progressAnim.removeListener(id);
-  }, []);
+  }, [progressAnim]);
 
   useEffect(() => {
     if (pendingHide && !progressDone.current) {
@@ -54,24 +76,12 @@ export function GlobalLoader({ minDisplayMs = 600 }: { minDisplayMs?: number }) 
       }).start(() => {
         setProgress(100);
         progressDone.current = true;
-        tryExit();
+        tryExitRef.current();
       });
     } else if (pendingHide && progressDone.current) {
-      tryExit();
+      tryExitRef.current();
     }
-  }, [pendingHide]);
-
-  const tryExit = () => {
-    if (!(progressDone.current && pendingHide)) return;
-    const elapsed = Date.now() - shownAt.current;
-    const wait = Math.max(0, minDisplayMs - elapsed);
-    setTimeout(() => {
-      Animated.timing(opacity, { toValue: 0, duration: 300, useNativeDriver: true }).start(() => {
-        setShow(false);
-        hide();
-      });
-    }, wait);
-  };
+  }, [pendingHide, progressAnim]);
 
   if (!show) return null;
 
@@ -96,7 +106,7 @@ export function GlobalLoader({ minDisplayMs = 600 }: { minDisplayMs?: number }) 
         </View>
       </View>
       <View style={styles.noteCard}>
-        <Text style={styles.noteHeader}>Today's note — 01</Text>
+        <Text style={styles.noteHeader}>Today&apos;s note — 01</Text>
         <Text style={styles.noteTitle}>Keep the signal. Lose the noise.</Text>
         <Text style={styles.noteItem}>01 — Read what the response is telling you.</Text>
         <Text style={styles.noteItem}>02 — Choose the next useful move.</Text>
@@ -120,19 +130,19 @@ const styles = StyleSheet.create({
   },
   content: { gap: 12 },
   kicker: { fontSize: 10, letterSpacing: 2, color: '#f59e0b', fontWeight: '600', textTransform: 'uppercase' },
-  title: { fontSize: 32, fontWeight: '700', color: '#17201f', lineHeight: 32, fontFamily: 'serif' as any },
-  subtitle: { fontSize: 14, color: 'rgba(23,32,31,0.6)', lineHeight: 20 },
-  statusRow: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 24, borderTopWidth: 1, borderTopColor: 'rgba(23,32,31,0.2)', paddingTop: 12 },
-  message: { fontSize: 12, color: 'rgba(23,32,31,0.65)' },
-  percent: { fontSize: 11, color: 'rgba(23,32,31,0.55)', fontFamily: 'monospace' as any },
-  progressBg: { height: 1, backgroundColor: 'rgba(23,32,31,0.15)', marginTop: 12, width: '100%' },
-  progressFg: { height: 1, backgroundColor: '#f59e0b' },
-  loadingRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 12 },
+  title: { fontSize: 22, fontWeight: '800', color: '#11181c' },
+  subtitle: { fontSize: 13, color: '#687076', lineHeight: 18 },
+  statusRow: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 8 },
+  message: { fontSize: 12, color: '#687076', fontWeight: '600' },
+  percent: { fontSize: 12, color: '#11181c', fontWeight: '800' },
+  progressBg: { height: 6, borderRadius: 3, backgroundColor: '#e5e5e5', overflow: 'hidden' },
+  progressFg: { height: 6, borderRadius: 3, backgroundColor: '#f59e0b' },
+  loadingRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 6 },
   dot: { width: 6, height: 6, borderRadius: 3, backgroundColor: '#f59e0b' },
-  loadingText: { fontSize: 10, letterSpacing: 1, color: 'rgba(23,32,31,0.4)', textTransform: 'uppercase' },
-  noteCard: { marginTop: 32, backgroundColor: '#fffdf7', borderWidth: 1, borderColor: 'rgba(23,32,31,0.15)', padding: 16, transform: [{ rotate: '-2deg' }] },
-  noteHeader: { fontSize: 10, letterSpacing: 1, color: 'rgba(23,32,31,0.45)', textTransform: 'uppercase', borderBottomWidth: 1, borderBottomColor: 'rgba(23,32,31,0.15)', paddingBottom: 8 },
-  noteTitle: { fontSize: 18, fontWeight: '600', color: '#17201f', marginTop: 12, fontFamily: 'serif' as any },
-  noteItem: { fontSize: 12, color: 'rgba(23,32,31,0.6)', marginTop: 8 },
-  noteFooter: { fontSize: 10, letterSpacing: 1, color: 'rgba(23,32,31,0.4)', textTransform: 'uppercase', borderTopWidth: 1, borderTopColor: 'rgba(23,32,31,0.15)', marginTop: 12, paddingTop: 8 },
+  loadingText: { fontSize: 11, color: '#687076', fontWeight: '600' },
+  noteCard: { marginTop: 28, backgroundColor: '#fff', borderRadius: 16, padding: 16, gap: 6, borderWidth: 1, borderColor: '#eae5de' },
+  noteHeader: { fontSize: 9, letterSpacing: 2, color: '#f59e0b', fontWeight: '700', textTransform: 'uppercase' },
+  noteTitle: { fontSize: 14, fontWeight: '800', color: '#11181c' },
+  noteItem: { fontSize: 11, color: '#687076', lineHeight: 16 },
+  noteFooter: { fontSize: 10, color: '#9aa0a6', marginTop: 4 },
 });

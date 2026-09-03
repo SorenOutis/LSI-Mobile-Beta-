@@ -1,7 +1,8 @@
-import { Link, useRouter } from 'expo-router';
+import { useRouter } from 'expo-router';
 import { useState } from 'react';
-import { ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { Alert, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { api, errorMessage } from '@/lib/api';
 
 export default function VerifyEmailScreen() {
   const router = useRouter();
@@ -10,10 +11,15 @@ export default function VerifyEmailScreen() {
 
   const onResend = async () => {
     setProcessing(true);
-    setTimeout(() => {
-      setProcessing(false);
+    try {
+      // Laravel/ Fortify verification endpoint on the LUA V6 backend.
+      await api.post('/email/verification-notification', {});
       setStatus('A new verification link has been sent to the email address you provided during registration.');
-    }, 700);
+    } catch (e) {
+      Alert.alert('Could not resend', errorMessage(e));
+    } finally {
+      setProcessing(false);
+    }
   };
 
   return (

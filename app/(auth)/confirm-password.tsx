@@ -2,6 +2,7 @@ import { useRouter } from 'expo-router';
 import { useState } from 'react';
 import { Alert, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { api, errorMessage } from '@/lib/api';
 
 export default function ConfirmPasswordScreen() {
   const router = useRouter();
@@ -14,10 +15,15 @@ export default function ConfirmPasswordScreen() {
       return;
     }
     setProcessing(true);
-    setTimeout(() => {
-      setProcessing(false);
+    try {
+      // Password confirmation on the LUA V6 backend (Fortify-style).
+      await api.post('/auth/confirm-password', { password });
       router.back();
-    }, 600);
+    } catch (e) {
+      Alert.alert('Confirmation failed', errorMessage(e));
+    } finally {
+      setProcessing(false);
+    }
   };
 
   return (

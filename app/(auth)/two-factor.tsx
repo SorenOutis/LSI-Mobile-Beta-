@@ -2,6 +2,7 @@ import { useRouter } from 'expo-router';
 import { useState } from 'react';
 import { Alert, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { api, errorMessage } from '@/lib/api';
 
 export default function TwoFactorScreen() {
   const router = useRouter();
@@ -11,7 +12,7 @@ export default function TwoFactorScreen() {
   const [processing, setProcessing] = useState(false);
 
   const onSubmit = async () => {
-    const val = showRecovery ? recoveryCode : code;
+    const val = (showRecovery ? recoveryCode : code).trim();
     if (!val) {
       Alert.alert('Error', 'Please enter the code.');
       return;
@@ -21,10 +22,20 @@ export default function TwoFactorScreen() {
       return;
     }
     setProcessing(true);
-    setTimeout(() => {
-      setProcessing(false);
+    try {
+      // Two-factor challenge on the LUA V6 backend (Fortify-style payload).
+      await api.post(
+        '/auth/two-factor/verify',
+        showRecovery ? { recovery_code: val } : { code: val }
+      );
       router.replace('/(tabs)' as any);
-    }, 600);
+    } catch (e) {
+      Alert.alert('Verification failed', errorMessage(e));
+      setCode('');
+      setRecoveryCode('');
+    } finally {
+      setProcessing(false);
+    }
   };
 
   return (

@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { Ionicons } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
 import { useEffect, useState } from 'react';
@@ -16,8 +15,8 @@ export default function ProfileScreen() {
   useEffect(() => {
     if (!token) return;
     setLoading(true);
-    api.get('/user').then(r => setProfile(r.data)).catch(() => setProfile(user)).finally(() => setLoading(false));
-  }, [token]);
+    api.get<any>('/user').then((r) => setProfile(r.data ?? r)).catch(() => setProfile(null)).finally(() => setLoading(false));
+  }, [token, user]);
   const p = profile ?? user;
   return (
     <SafeAreaView style={styles.safe} edges={['top']}>
@@ -25,7 +24,7 @@ export default function ProfileScreen() {
         <View style={styles.header}>
           <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}><Ionicons name="chevron-back" size={20} color="#1A1E22" /></TouchableOpacity>
           <Text style={styles.headerTitle}>Profile</Text>
-          <TouchableOpacity style={styles.moreBtn}><Ionicons name="ellipsis-horizontal" size={18} color="#1A1E22" /></TouchableOpacity>
+          <TouchableOpacity style={styles.moreBtn} onPress={() => router.push('/settings' as any)} accessibilityLabel="Account settings"><Ionicons name="settings-outline" size={18} color="#1A1E22" /></TouchableOpacity>
         </View>
         <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
           {loading ? <PageSkeleton count={3} /> : !p ? (

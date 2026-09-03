@@ -1,35 +1,92 @@
 import * as SecureStore from 'expo-secure-store';
 import Constants from 'expo-constants';
 import { Platform } from 'react-native';
+import { useSyncExternalStore } from 'react';
 
-const getBaseUrl = () => {
-  const fromEnv = process.env.EXPO_PUBLIC_API_URL as string | undefined;
-  if (fromEnv) return fromEnv.replace(/\/$/, '');
-  if (Platform.OS === 'web') return 'http://localhost:9000';
-  const host = (Constants.expoConfig?.hostUri || '').split(':')[0];
-  if (host) return `http://${host}:9000`;
-  return 'http://localhost:9000';
-};
-
-const BASE_URL = getBaseUrl();
-if (!BASE_URL) throw new Error('EXPO_PUBLIC_API_URL is not defined');
-
-const TOKEN_KEY = 'auth_token';
 const isWeb = Platform.OS === 'web';
 
+// LUA V6 backend port (the web app is served on this port; API routes live under /api).
+const API_PORT = 9000;
+
+function isAndroidEmulator(): boolean {
+  if (Platform.OS !== 'android') return false;
+  const fp: string | undefined = (Platform.constants as any)?.build?.FINGERPRINT;
+  if (!fp) return false;
+  return /google|generic|sdk_gphone|emulator|simulator|redhat/i.test(fp);
+}
+
+// ---------------------------------------------------------------------------
+// Base URL resolution.
+//  1. EXPO_PUBLIC_API_URL — explicit override (use this for production HTTPS).
+//  2. Web — localhost (Metro proxies /api to the backend, or the backend is local).
+//  3. Android emulator — 10.0.2.2 aliases the host machine's loopback.
+//  4. Physical device — the dev machine's LAN IP (from `hostUri`), same Wi-Fi.
+// ---------------------------------------------------------------------------
+const getBaseUrl = (): string => {
+  const fromEnv = process.env.EXPO_PUBLIC_API_URL as string | undefined;
+  if (fromEnv) {
+    const url = fromEnv.replace(/\/$/, '');
+    if (isWeb) return url;
+    if (/localhost|127\.0\.0\.1/.test(url)) {
+      if (Platform.OS === 'android' && !isAndroidEmulator()) {
+        console.warn(
+          '[api] EXPO_PUBLIC_API_URL points at localhost, which is unreachable from a physical Android device. Set it to your machine\'s LAN IP (e.g. http://192.168.1.20:9000) or http://10.0.2.2:9000 on the emulator.'
+        );
+      } else if (Platform.OS === 'ios') {
+        console.warn(
+          '[api] EXPO_PUBLIC_API_URL points at localhost — only the iOS simulator can reach it. On a physical iPhone set it to your machine\'s LAN IP.'
+        );
+      }
+    }
+    if (url.startsWith('http://') && !__DEV__) {
+      console.warn('[api] Non-dev build is using plain HTTP. Use an EXPO_PUBLIC_API_URL with https:// for release builds.');
+    }
+    return url;
+  }
+  if (isWeb) return `http://localhost:${API_PORT}`;
+  if (Platform.OS === 'android' && isAndroidEmulator()) return `http://10.0.2.2:${API_PORT}`;
+  const host = (Constants.expoConfig?.hostUri || '').split(':')[0];
+  if (host) return `http://${host}:${API_PORT}`;
+  return `http://localhost:${API_PORT}`;
+};
+
+export const API_BASE_URL = getBaseUrl();
+
+/** Absolute URL of a page in the LUA V6 web app (same origin as the API). */
+export const webLink = (path: string): string =>
+  `${API_BASE_URL}${path.startsWith('/') ? path : `/${path}`}`;
+
+// ---------------------------------------------------------------------------
+// Token storage (SecureStore on native, localStorage on web — mirrors the
+// web app's storage keys so logout can clean up shared demo/local data).
+// ---------------------------------------------------------------------------
+const TOKEN_KEY = 'auth_token';
+
 const webStore = {
-  getItemAsync: async (k: string) => {
-    try { return isWeb ? localStorage.getItem(k) : null; } catch { return null; }
+  getItemAsync: async (k: string): Promise<string | null> => {
+    try {
+      return isWeb ? localStorage.getItem(k) : null;
+    } catch {
+      return null;
+    }
   },
-  setItemAsync: async (k: string, v: string) => {
-    try { if (isWeb) localStorage.setItem(k, v); } catch {}
+  setItemAsync: async (k: string, v: string): Promise<void> => {
+    try {
+      if (isWeb) localStorage.setItem(k, v);
+    } catch {
+      /* ignore */
+    }
   },
-  deleteItemAsync: async (k: string) => {
-    try { if (isWeb) localStorage.removeItem(k); } catch {}
+  deleteItemAsync: async (k: string): Promise<void> => {
+    try {
+      if (isWeb) localStorage.removeItem(k);
+    } catch {
+      /* ignore */
+    }
   },
 };
 
-const store: typeof SecureStore = (isWeb ? (webStore as any) : SecureStore) as any;
+const store = (isWeb ? webStore : SecureStore) as typeof SecureStore;
 
 export const tokenStore = {
   get: () => store.getItemAsync(TOKEN_KEY),
@@ -37,61 +94,112 @@ export const tokenStore = {
   remove: () => store.deleteItemAsync(TOKEN_KEY),
 };
 
-class ApiError extends Error {
-  constructor(message: string, public status: number, public code?: string) {
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public status: number,
+    public code?: string,
+    /** Laravel field-validation errors, e.g. { email: ['...'] } */
+    public errors?: Record<string, string[]>,
+  ) {
     super(message);
     this.name = 'ApiError';
   }
 }
 
+/** Human-readable message for any thrown value (use in Alerts everywhere). */
+export function errorMessage(e: unknown): string {
+  if (e instanceof ApiError) {
+    const firstFieldError = e.errors ? Object.values(e.errors).flat()[0] : undefined;
+    return firstFieldError ?? e.message;
+  }
+  if (e instanceof Error && e.message) return e.message;
+  return 'Something went wrong. Please try again.';
+}
+
+// ---------------------------------------------------------------------------
+// Connection status (so the UI can show "can't reach the server" instead of
+// silent empty states).
+// ---------------------------------------------------------------------------
+export type ConnectionState = { reachable: boolean; lastErrorAt: number | null };
+
+let connState: ConnectionState = { reachable: true, lastErrorAt: null };
+const connListeners = new Set<() => void>();
+
+function setConnection(reachable: boolean) {
+  if (connState.reachable === reachable) return;
+  connState = { reachable, lastErrorAt: reachable ? null : Date.now() };
+  connListeners.forEach((l) => l());
+}
+
+/** React hook: true once a request has failed at the network level. */
+export function useConnection(): ConnectionState {
+  return useSyncExternalStore(
+    (cb) => {
+      connListeners.add(cb);
+      return () => connListeners.delete(cb);
+    },
+    () => connState,
+    () => connState,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Fetch core
+// ---------------------------------------------------------------------------
 const authFetch = async (path: string, options: RequestInit = {}) => {
   const token = await tokenStore.get();
+  const bodyIsFormData = typeof FormData !== 'undefined' && options.body instanceof FormData;
   const headers: Record<string, string> = {
     Accept: 'application/json',
-    'Content-Type': 'application/json',
-    ...(options.headers as Record<string, string>),
+    // Let fetch set the multipart boundary for FormData uploads.
+    ...(bodyIsFormData ? {} : { 'Content-Type': 'application/json' }),
+    ...((options.headers as Record<string, string>) || {}),
   };
   if (token) headers.Authorization = `Bearer ${token}`;
-  return fetch(`${BASE_URL}/api${path}`, { ...options, headers });
+  return fetch(`${API_BASE_URL}/api${path}`, { ...options, headers });
 };
 
-const fetchWithErrorHandling = async (path: string, options?: RequestInit) => {
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  let response: Response;
   try {
-    const response = await authFetch(path, options);
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new ApiError(error.message || `HTTP ${response.status}`, response.status, error.code);
-    }
-    const text = await response.text();
-    return text ? JSON.parse(text) : null;
-  } catch (error) {
-    if (error instanceof ApiError) throw error;
-    throw new ApiError('Network error', 0, 'NETWORK_ERROR');
+    response = await authFetch(path, options);
+  } catch {
+    setConnection(false);
+    throw new ApiError('Cannot reach the server. Check your connection.', 0, 'NETWORK_ERROR');
   }
-};
+  // The server answered — connection is fine even if the status is an error.
+  setConnection(true);
 
-// Skill-compliant API client using fetch (not axios)
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new ApiError(
+      error.message || `Request failed (HTTP ${response.status})`,
+      response.status,
+      error.code,
+      error.errors,
+    );
+  }
+  const text = await response.text();
+  if (!text) return null as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new ApiError('Invalid response from server.', response.status, 'BAD_JSON');
+  }
+}
+
 export const api = {
-  get: <T,>(path: string): Promise<T> => fetchWithErrorHandling(path, { method: 'GET' }),
+  get: <T,>(path: string): Promise<T> => request<T>(path, { method: 'GET' }),
   post: <T,>(path: string, body?: unknown): Promise<T> =>
-    fetchWithErrorHandling(path, { method: 'POST', body: body ? JSON.stringify(body) : undefined }),
+    request<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) }),
   put: <T,>(path: string, body?: unknown): Promise<T> =>
-    fetchWithErrorHandling(path, { method: 'PUT', body: body ? JSON.stringify(body) : undefined }),
-  delete: <T,>(path: string): Promise<T> => fetchWithErrorHandling(path, { method: 'DELETE' }),
-  // For FormData (assignments file upload) - don't set Content-Type, let fetch set boundary
-  postForm: async <T,>(path: string, formData: FormData): Promise<T> => {
-    const token = await tokenStore.get();
-    const response = await fetch(`${BASE_URL}/api${path}`, {
-      method: 'POST',
-      headers: { Accept: 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-      body: formData,
-    });
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new ApiError(error.message || `HTTP ${response.status}`, response.status);
-    }
-    return response.json();
-  },
+    request<T>(path, { method: 'PUT', body: body === undefined ? undefined : JSON.stringify(body) }),
+  delete: <T,>(path: string): Promise<T> => request<T>(path, { method: 'DELETE' }),
+  /** For FormData (e.g. assignment file upload). */
+  postForm: <T,>(path: string, formData: FormData): Promise<T> =>
+    request<T>(path, { method: 'POST', body: formData }),
 };
-
-export { ApiError };

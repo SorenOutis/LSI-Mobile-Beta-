@@ -1,8 +1,9 @@
 import { Ionicons } from '@expo/vector-icons';
-import { useEffect, useState } from 'react';
-import { Modal, Platform, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { useCallback, useEffect, useState } from 'react';
+import * as Linking from 'expo-linking';
+import { Alert, Modal, Platform, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { api } from '@/lib/api';
+import { api, errorMessage, webLink } from '@/lib/api';
 import { useAuth } from '@/context/AuthContext';
 import { PageSkeleton } from '@/components/PageSkeleton';
 
@@ -12,33 +13,91 @@ export default function TasksScreen() {
   const [showSubmit, setShowSubmit] = useState(false);
   const [showGroup, setShowGroup] = useState(false);
   const [showFeedback, setShowFeedback] = useState(false);
-  const [showDetail, setShowDetail] = useState(false);
+  const [submitFor, setSubmitFor] = useState<any>(null);
+  const [feedbackFor, setFeedbackFor] = useState<any>(null);
   const [submitText, setSubmitText] = useState('');
-  const [groupCode, setGroupCode] = useState('');
+  const [busy, setBusy] = useState(false);
   const { token } = useAuth();
   const [assignments, setAssignments] = useState<any[] | null>(null);
-  const [loading, setLoading] = useState(false);
-  useEffect(() => {
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
     if (!token) return;
     setLoading(true);
-    api
-      .get('/assignments')
-      .then((r: any) => {
-        const d = r.data ?? r;
-        setAssignments(d.assignments ?? d ?? []);
-      })
-      .catch(() => setAssignments([]))
-      .finally(() => setLoading(false));
+    setError(null);
+    try {
+      const r: any = await api.get('/assignments');
+      const d = r.data ?? r;
+      setAssignments(d.assignments ?? d ?? []);
+    } catch (e) {
+      setError(errorMessage(e));
+      setAssignments([]);
+    } finally {
+      setLoading(false);
+    }
   }, [token]);
-  const filtered = assignments === null ? null : assignments.filter((a: any) => (tab === 'All' ? true : tab === 'To do' ? !a.submission?.submitted : !!a.submission?.submitted));
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const openSubmit = (a: any) => {
+    setSubmitFor(a);
+    setSubmitText('');
+    setShowSubmit(true);
+  };
+
+  const doSubmit = async () => {
+    const a = submitFor;
+    if (!a) return;
+    const content = submitText.trim();
+    if (!content) {
+      Alert.alert('Nothing to submit', 'Paste a link or text for your submission first.');
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.post(`/assignments/${a.id}/submit`, { content });
+      setAssignments((prev) =>
+        (prev ?? []).map((x: any) => (x.id === a.id ? { ...x, submission: { ...(x.submission ?? {}), submitted: true } } : x))
+      );
+      setShowSubmit(false);
+    } catch (e) {
+      Alert.alert('Submit failed', errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const markFeedbackSeen = async () => {
+    const a = feedbackFor;
+    if (!a) return;
+    setBusy(true);
+    try {
+      await api.post(`/assignments/${a.id}/feedback/read`);
+      setAssignments((prev) =>
+        (prev ?? []).map((x: any) => (x.id === a.id ? { ...x, submission: { ...(x.submission ?? {}), has_unseen_feedback: false } } : x))
+      );
+      setShowFeedback(false);
+    } catch (e) {
+      Alert.alert('Could not update feedback', errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const filtered =
+    assignments === null
+      ? null
+      : assignments.filter((a: any) => (tab === 'All' ? true : tab === 'To do' ? !a.submission?.submitted : !!a.submission?.submitted));
   return (
     <SafeAreaView style={styles.safe} edges={['top']}>
       <View style={styles.webWrap}>
         <View style={styles.header}>
           <Text style={styles.headerTitle}>Assignments</Text>
           <View style={styles.headerActions}>
-            <TouchableOpacity style={styles.iconBtn}><Ionicons name="search" size={20} color="#1A1E22" /></TouchableOpacity>
-            <TouchableOpacity style={styles.iconBtn} onPress={() => setShowGroup(true)}><Ionicons name="people-outline" size={20} color="#1A1E22" /></TouchableOpacity>
+            <TouchableOpacity style={styles.iconBtn} onPress={() => setShowGroup(true)} accessibilityLabel="Groups"><Ionicons name="people-outline" size={20} color="#1A1E22" /></TouchableOpacity>
           </View>
         </View>
         <ScrollView style={styles.container} contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
@@ -49,14 +108,14 @@ export default function TasksScreen() {
               </TouchableOpacity>
             ))}
           </View>
-          {loading ? <PageSkeleton count={3} /> : filtered === null ? (
-            <>
-              <Text style={[styles.sectionLabel, { color: '#D96A3E' }]}>Overdue</Text>
-              <View style={[styles.assignCard, { backgroundColor: '#FFF6F0', borderColor: '#F0C4B0' }]}>
-                <View style={styles.assignTop}><View style={[styles.assignIcon, { backgroundColor: '#D96A3E' }]}><Ionicons name="alert-circle-outline" size={28} color="#fff" /></View><View style={{ flex: 1 }}><Text style={styles.assignTitle}>Algebra worksheet</Text><Text style={styles.assignSub}>Due yesterday</Text></View><View style={styles.badgeOverdue}><Ionicons name="alert-circle-outline" size={14} color="#D96A3E" /><Text style={styles.badgeOverdueText}>Overdue</Text></View></View>
-                <TouchableOpacity style={[styles.assignBtn, { backgroundColor: '#D96A3E' }]} onPress={() => setShowSubmit(true)}><Text style={styles.assignBtnText}>Open assignment</Text></TouchableOpacity>
-              </View>
-            </>
+          {loading ? <PageSkeleton count={3} /> : error ? (
+            <View style={{ alignItems: 'center', gap: 8, paddingVertical: 32 }}>
+              <Ionicons name="cloud-offline-outline" size={32} color="#8A8A8A" />
+              <Text style={{ fontSize: 12, color: '#6B7280' }}>{error}</Text>
+              <TouchableOpacity style={[styles.assignBtn, { backgroundColor: '#1A1E22', paddingHorizontal: 24 }]} onPress={load}><Text style={styles.assignBtnText}>Try again</Text></TouchableOpacity>
+            </View>
+          ) : !filtered ? (
+            <PageSkeleton count={3} />
           ) : filtered.length === 0 ? (
             <View style={{ alignItems: 'center', paddingVertical: 32 }}><Text style={{ fontWeight: '700' }}>No assignments in {tab}</Text></View>
           ) : (
@@ -67,16 +126,15 @@ export default function TasksScreen() {
                   <View style={{ flex: 1 }}><Text style={styles.assignTitle}>{a.title}</Text><Text style={styles.assignSub}>{a.due_date ?? 'No deadline'}</Text></View>
                   <View style={a.submission?.submitted ? styles.badgeToday : styles.badgeUpcoming}><Text style={a.submission?.submitted ? styles.badgeTodayText : styles.badgeUpcomingText}>{a.submission?.submitted ? 'Submitted' : 'To do'}</Text></View>
                 </View>
-                <TouchableOpacity style={[styles.assignBtn, { backgroundColor: '#D96A3E' }]} onPress={() => (a.submission?.has_unseen_feedback ? setShowFeedback(true) : setShowSubmit(true))}><Text style={styles.assignBtnText}>{a.submission?.has_unseen_feedback ? 'View feedback' : 'Open'}</Text></TouchableOpacity>
+                <TouchableOpacity style={[styles.assignBtn, { backgroundColor: '#D96A3E' }]} onPress={() => (a.submission?.has_unseen_feedback ? (setFeedbackFor(a), setShowFeedback(true)) : openSubmit(a))}><Text style={styles.assignBtnText}>{a.submission?.has_unseen_feedback ? 'View feedback' : 'Open'}</Text></TouchableOpacity>
               </View>
             ))
           )}
           <View style={{ height: 20 }} />
         </ScrollView>
-        <Modal visible={showSubmit} transparent animationType="slide" onRequestClose={() => setShowSubmit(false)}><View style={styles.modalOverlay}><View style={styles.modalSheet}><View style={styles.handle} /><Text style={styles.modalTitle}>Submit assignment</Text><View style={styles.inputWrap}><TextInput value={submitText} onChangeText={setSubmitText} placeholder="Paste link..." placeholderTextColor="#9AA0A6" multiline style={styles.modalInput} /></View><View style={styles.modalRow}><TouchableOpacity onPress={() => setShowSubmit(false)} style={styles.modalCancel}><Text style={styles.modalCancelText}>Cancel</Text></TouchableOpacity><TouchableOpacity onPress={() => setShowSubmit(false)} style={styles.modalConfirm}><Text style={styles.modalConfirmText}>Submit</Text></TouchableOpacity></View></View></View></Modal>
-        <Modal visible={showGroup} transparent animationType="fade" onRequestClose={() => setShowGroup(false)}><View style={styles.modalOverlay}><View style={styles.modalCard}><Text style={styles.modalTitle}>Group</Text><TouchableOpacity onPress={() => setShowGroup(false)} style={styles.modalConfirm}><Text style={styles.modalConfirmText}>Done</Text></TouchableOpacity></View></View></Modal>
-        <Modal visible={showFeedback} transparent animationType="fade" onRequestClose={() => setShowFeedback(false)}><View style={styles.modalOverlay}><View style={styles.modalCard}><Text style={styles.modalTitle}>Feedback</Text><TouchableOpacity onPress={() => setShowFeedback(false)} style={styles.modalConfirm}><Text style={styles.modalConfirmText}>Mark as seen</Text></TouchableOpacity></View></View></Modal>
-        <Modal visible={showDetail} transparent animationType="fade" onRequestClose={() => setShowDetail(false)}><View style={styles.modalOverlay}><View style={styles.modalCard}><Text style={styles.modalTitle}>Detail</Text><TouchableOpacity onPress={() => setShowDetail(false)} style={styles.modalCancel}><Text style={styles.modalCancelText}>Close</Text></TouchableOpacity></View></View></Modal>
+        <Modal visible={showSubmit} transparent animationType="slide" onRequestClose={() => setShowSubmit(false)}><View style={styles.modalOverlay}><View style={styles.modalSheet}><View style={styles.handle} /><Text style={styles.modalTitle}>Submit: {submitFor?.title ?? 'assignment'}</Text><View style={styles.inputWrap}><TextInput value={submitText} onChangeText={setSubmitText} placeholder="Paste link or submission text..." placeholderTextColor="#9AA0A6" multiline style={styles.modalInput} /></View><View style={styles.modalRow}><TouchableOpacity onPress={() => setShowSubmit(false)} style={styles.modalCancel}><Text style={styles.modalCancelText}>Cancel</Text></TouchableOpacity><TouchableOpacity onPress={doSubmit} disabled={busy} style={[styles.modalConfirm, busy && { opacity: 0.7 }]}><Text style={styles.modalConfirmText}>{busy ? 'Submitting...' : 'Submit'}</Text></TouchableOpacity></View></View></View></Modal>
+        <Modal visible={showGroup} transparent animationType="fade" onRequestClose={() => setShowGroup(false)}><View style={styles.modalOverlay}><View style={styles.modalCard}><Text style={styles.modalTitle}>Group assignments</Text><Text style={styles.groupNote}>Group submissions are managed on the LUA V6 web app for now.</Text><TouchableOpacity onPress={() => Linking.openURL(webLink('/assignments'))} style={styles.modalConfirm}><Text style={styles.modalConfirmText}>Open in web app</Text></TouchableOpacity><TouchableOpacity onPress={() => setShowGroup(false)} style={styles.modalCancel}><Text style={styles.modalCancelText}>Close</Text></TouchableOpacity></View></View></Modal>
+        <Modal visible={showFeedback} transparent animationType="fade" onRequestClose={() => setShowFeedback(false)}><View style={styles.modalOverlay}><View style={styles.modalCard}><Text style={styles.modalTitle}>Feedback</Text><Text style={styles.groupNote}>{feedbackFor?.submission?.feedback ?? feedbackFor?.feedback ?? 'Your teacher\'s feedback will appear here. Mark it as seen to hide the badge.'}</Text><TouchableOpacity onPress={markFeedbackSeen} disabled={busy} style={[styles.modalConfirm, busy && { opacity: 0.7 }]}><Text style={styles.modalConfirmText}>{busy ? 'Updating...' : 'Mark as seen'}</Text></TouchableOpacity><TouchableOpacity onPress={() => setShowFeedback(false)} style={styles.modalCancel}><Text style={styles.modalCancelText}>Close</Text></TouchableOpacity></View></View></Modal>
       </View>
     </SafeAreaView>
   );
@@ -111,6 +169,7 @@ const styles = StyleSheet.create({
   assignBtnText: { color: '#fff', fontWeight: '800', fontSize: 14 },
   modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', alignItems: 'center', justifyContent: 'center', padding: 20 },
   modalSheet: { width: '100%', maxWidth: 480, backgroundColor: '#fff', borderRadius: 16, padding: 16, gap: 12 } as any,
+  groupNote: { fontSize: 12, color: '#6B7280', textAlign: 'center', lineHeight: 16 },
   modalCard: { width: '100%', maxWidth: 360, backgroundColor: '#fff', borderRadius: 16, padding: 20, gap: 12, alignItems: 'center' },
   handle: { width: 40, height: 4, borderRadius: 2, backgroundColor: '#EAE5DE', alignSelf: 'center' },
   modalTitle: { fontSize: 16, fontWeight: '900', color: '#1A1E22', textAlign: 'center' },

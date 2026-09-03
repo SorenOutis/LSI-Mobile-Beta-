@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { Alert, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useAuth } from '@/context/AuthContext';
+import { errorMessage } from '@/lib/api';
 
 export default function LoginScreen() {
   const router = useRouter();
@@ -11,7 +12,6 @@ export default function LoginScreen() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
-  const [remember, setRemember] = useState(false);
   const [processing, setProcessing] = useState(false);
 
   const onSubmit = async () => {
@@ -23,9 +23,8 @@ export default function LoginScreen() {
     try {
       await login(email.trim(), password);
       router.replace('/(tabs)' as any);
-    } catch (e: any) {
-      const msg = e?.response?.data?.message || e?.response?.data?.errors?.email?.[0] || 'Login failed. Check credentials.';
-      Alert.alert('Login failed', msg);
+    } catch (e) {
+      Alert.alert('Login failed', errorMessage(e));
     } finally {
       setProcessing(false);
     }
@@ -91,37 +90,14 @@ export default function LoginScreen() {
             </View>
           </View>
 
-          {/* Remember */}
-          <TouchableOpacity style={styles.rememberRow} onPress={() => setRemember(!remember)}>
-            <View style={[styles.checkbox, remember && styles.checkboxChecked]}>
-              {remember && <Ionicons name="checkmark" size={12} color="#fff" />}
-            </View>
-            <Text style={styles.rememberText}>Remember me</Text>
-          </TouchableOpacity>
-
           <TouchableOpacity style={[styles.primaryBtn, processing && { opacity: 0.7 }]} onPress={onSubmit} disabled={processing}>
             <Text style={styles.primaryBtnText}>{processing ? 'Logging in...' : 'Log in'}</Text>
           </TouchableOpacity>
 
-          {/* Social */}
-          <View style={styles.divider}>
-            <View style={styles.dividerLine} />
-            <Text style={styles.dividerLabel}>Social Login</Text>
-            <View style={styles.dividerLine} />
-          </View>
-          <View style={styles.socialRow}>
-            <TouchableOpacity style={styles.socialBtn}>
-              <Ionicons name="logo-google" size={18} color="#1A1E22" />
-              <Text style={styles.socialText}>Continue with Google</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.socialBtn}>
-              <Ionicons name="logo-github" size={18} color="#1A1E22" />
-              <Text style={styles.socialText}>Continue with GitHub</Text>
-            </TouchableOpacity>
-          </View>
+          {/* Social login is handled by the LUA V6 web app (see Settings → Connected accounts). */}
 
           <View style={styles.footerRow}>
-            <Text style={styles.footerMuted}>Don't have an account? </Text>
+            <Text style={styles.footerMuted}>Don&apos;t have an account? </Text>
             <Link href="/(auth)/register" asChild>
               <TouchableOpacity>
                 <Text style={styles.footerLink}>Sign up</Text>
@@ -157,18 +133,11 @@ const styles = StyleSheet.create({
   input: { flex: 1, paddingVertical: 12, fontSize: 14, color: '#1A1E22' },
   forgotRow: { alignItems: 'flex-end', marginTop: 6 },
   forgotText: { fontSize: 12, color: '#1A1E22', fontWeight: '600', textDecorationLine: 'underline' },
-  rememberRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  checkbox: { width: 18, height: 18, borderRadius: 4, borderWidth: 1, borderColor: '#CFCFCF', backgroundColor: '#fff', alignItems: 'center', justifyContent: 'center' },
-  checkboxChecked: { backgroundColor: '#1A1E22', borderColor: '#1A1E22' },
-  rememberText: { fontSize: 13, color: '#1A1E22' },
   primaryBtn: { backgroundColor: '#15181E', borderRadius: 10, paddingVertical: 14, alignItems: 'center' },
   primaryBtnText: { color: '#fff', fontWeight: '800', fontSize: 14 },
   divider: { flexDirection: 'row', alignItems: 'center', gap: 12, marginTop: 4, borderTopWidth: 1, borderTopColor: '#EAE5DE', paddingTop: 16 },
   dividerLine: { flex: 1, height: 1, backgroundColor: '#EAE5DE' },
   dividerLabel: { fontSize: 10, letterSpacing: 1, color: '#6B7280', fontWeight: '700', textTransform: 'uppercase' },
-  socialRow: { gap: 10 },
-  socialBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 10, paddingVertical: 12, backgroundColor: '#FFFEFC' },
-  socialText: { fontSize: 13, fontWeight: '700', color: '#1A1E22' },
   footerRow: { flexDirection: 'row', justifyContent: 'center', gap: 4 },
   footerMuted: { fontSize: 12, color: '#6B7280' },
   footerLink: { fontSize: 12, fontWeight: '700', color: '#1A1E22', textDecorationLine: 'underline' },

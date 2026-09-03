@@ -1,21 +1,31 @@
-import { Link, useRouter } from 'expo-router';
+import { Link } from 'expo-router';
 import { useState } from 'react';
-import { ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { Alert, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { api, errorMessage } from '@/lib/api';
+
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export default function ForgotPasswordScreen() {
-  const router = useRouter();
   const [email, setEmail] = useState('');
   const [processing, setProcessing] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
 
   const onSubmit = async () => {
-    if (!email) return;
+    if (!EMAIL_PATTERN.test(email.trim())) {
+      Alert.alert('Invalid email', 'Please enter a valid email address.');
+      return;
+    }
     setProcessing(true);
-    setTimeout(() => {
+    try {
+      // Fortify-style endpoint on the LUA V6 backend.
+      await api.post('/auth/forgot-password', { email: email.trim() });
+      setStatus('We have emailed your password reset link if an account exists for that address.');
+    } catch (e) {
+      Alert.alert('Could not send reset link', errorMessage(e));
+    } finally {
       setProcessing(false);
-      setStatus('We have emailed your password reset link.');
-    }, 700);
+    }
   };
 
   return (
