@@ -1,7 +1,9 @@
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
+import * as Linking from 'expo-linking';
 import { ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { webLink } from '@/lib/api';
 
 export default function WelcomeScreen() {
   const router = useRouter();
@@ -17,10 +19,7 @@ export default function WelcomeScreen() {
             <Text style={styles.koami}>  KOAMISHIN</Text>
           </View>
           <View style={styles.headerIcons}>
-            <TouchableOpacity style={styles.iconBtn}>
-              <Ionicons name="moon-outline" size={22} color="#1A1E22" />
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.iconBtn}>
+            <TouchableOpacity style={styles.iconBtn} onPress={() => router.push('/more' as any)} accessibilityLabel="Menu">
               <Ionicons name="menu" size={26} color="#1A1E22" />
             </TouchableOpacity>
           </View>
@@ -139,7 +138,7 @@ export default function WelcomeScreen() {
               <Text style={styles.darkSub}>Partner with our team to make the most of LSI in your classroom.</Text>
             </View>
           </View>
-          <TouchableOpacity style={styles.contactBtn}>
+          <TouchableOpacity style={styles.contactBtn} onPress={() => Linking.openURL(webLink('/contact'))}>
             <Text style={styles.contactText}>Contact sales</Text>
             <Ionicons name="chevron-forward" size={18} color="#C96A3E" />
           </TouchableOpacity>

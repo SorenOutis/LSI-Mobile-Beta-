@@ -1,24 +1,38 @@
-// @ts-nocheck
 import { Ionicons } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { ScrollView, StyleSheet, Text, TouchableOpacity, View, Image } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { api } from '@/lib/api';
+import { api, errorMessage } from '@/lib/api';
 import { useAuth } from '@/context/AuthContext';
 import { PageSkeleton } from '@/components/PageSkeleton';
+import { initials } from '@/lib/format';
 
 export default function LeaderboardFull() {
   const router = useRouter();
   const { token } = useAuth();
   const [data, setData] = useState<any>(null);
-  const [loading, setLoading] = useState(false);
-  useEffect(() => {
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const load = useCallback(async () => {
     if (!token) return;
     setLoading(true);
-    api.get('/leaderboard').then(r => setData(r.data)).catch(() => setData({ sectionLeaderboards: [] })).finally(() => setLoading(false));
+    setError(null);
+    try {
+      const r: any = await api.get('/mobile/leaderboard');
+      setData(r.data ?? r);
+    } catch (e) {
+      setError(errorMessage(e));
+      setData(null);
+    } finally {
+      setLoading(false);
+    }
   }, [token]);
-  const boards: any[] = data?.sectionLeaderboards ?? data?.data ?? [];
+
+  useEffect(() => {
+    load();
+  }, [load]);
+  const boards: any[] = data?.leaderboards ?? data?.sectionLeaderboards ?? data?.data ?? [];
   const first = boards[0];
   return (
     <SafeAreaView style={styles.safe} edges={['top']}>
@@ -29,8 +43,16 @@ export default function LeaderboardFull() {
           <View style={{ width: 36 }} />
         </View>
         <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
-          {loading ? <PageSkeleton count={5} /> : boards.length === 0 ? (
-            <View style={{ alignItems: 'center', paddingVertical: 32 }}><Text>No leaderboard data</Text></View>
+          {loading ? (
+            <PageSkeleton count={5} />
+          ) : error ? (
+            <View style={{ alignItems: 'center', gap: 8, paddingVertical: 32 }}>
+              <Ionicons name="cloud-offline-outline" size={32} color="#8A8A8A" />
+              <Text style={{ fontSize: 12, color: '#6B7280' }}>{error}</Text>
+              <TouchableOpacity style={styles.retryBtn} onPress={load}><Text style={{ color: '#fff', fontWeight: '700', fontSize: 12 }}>Try again</Text></TouchableOpacity>
+            </View>
+          ) : boards.length === 0 ? (
+            <View style={{ alignItems: 'center', paddingVertical: 32 }}><Text>No leaderboard data yet</Text></View>
           ) : (
             <>
               <View style={styles.intro}>
@@ -43,7 +65,13 @@ export default function LeaderboardFull() {
                   {b.users?.slice(0, 10).map((u: any) => (
                     <View key={u.id} style={[styles.row, u.isCurrentUser && styles.rowMe]}>
                       <Text style={styles.rankNum}>#{u.rank ?? u.position}</Text>
-                      <Image source={{ uri: u.avatar ?? `https://i.pravatar.cc/100?img=${u.id % 70}` }} style={styles.avatar} />
+                      {u.avatar ? (
+                        <Image source={{ uri: u.avatar }} style={styles.avatar} />
+                      ) : (
+                        <View style={[styles.avatar, { alignItems: 'center', justifyContent: 'center', backgroundColor: '#D96A3E' }]}>
+                          <Text style={{ color: '#fff', fontSize: 9, fontWeight: '800' }}>{initials(u.name)}</Text>
+                        </View>
+                      )}
                       <View style={{ flex: 1 }}><Text style={styles.name}>{u.name}</Text><Text style={styles.sub}>{u.xp ?? u.exp} XP</Text></View>
                       <Text style={styles.xp}>{u.xp ?? u.exp}</Text>
                     </View>
@@ -64,6 +92,7 @@ const styles = StyleSheet.create({
   backBtn: { width: 36, height: 36, borderRadius: 10, borderWidth: 1, borderColor: '#EAE5DE', backgroundColor: '#fff', alignItems: 'center', justifyContent: 'center' },
   headerTitle: { fontSize: 16, fontWeight: '800', color: '#1A1E22' },
   content: { padding: 14, gap: 14 },
+  retryBtn: { backgroundColor: '#1A1E22', borderRadius: 10, paddingHorizontal: 20, paddingVertical: 10, marginTop: 4 },
   intro: { backgroundColor: '#fff', borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 16, padding: 16, gap: 10 },
   introTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   kicker: { fontSize: 10, letterSpacing: 1, fontWeight: '800', color: '#D96A3E', textTransform: 'uppercase' },

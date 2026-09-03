@@ -1,52 +1,69 @@
-// @ts-nocheck
 import { Ionicons } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View, Image } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { api } from '@/lib/api';
+import { api, errorMessage } from '@/lib/api';
 import { useAuth } from '@/context/AuthContext';
 
-type Course = { id: number; name: string; description: string; progress: number; totalLessons: number; completedLessons: number; xpEarned: number; modulesCount: number; cover?: string };
-
-const MOCK: Course[] = [
-  { id: 1, name: 'Algebra Fundamentals', description: 'Master linear equations and inequalities through hands-on practice.', progress: 68, totalLessons: 24, completedLessons: 16, xpEarned: 420, modulesCount: 6, cover: 'https://images.unsplash.com/photo-1503676260728-1c00da094a0b?w=400' },
-  { id: 2, name: 'Biology: Cell Systems', description: 'Explore cell structure, genetics and evolution.', progress: 100, totalLessons: 18, completedLessons: 18, xpEarned: 510, modulesCount: 4 },
-  { id: 3, name: 'English Literature', description: 'Reading comprehension and essay writing skills.', progress: 24, totalLessons: 20, completedLessons: 5, xpEarned: 180, modulesCount: 5 },
-  { id: 4, name: 'History: Modern World', description: 'From revolutions to global conflicts.', progress: 42, totalLessons: 16, completedLessons: 7, xpEarned: 260, modulesCount: 3 },
-];
+type Course = {
+  id: number;
+  name?: string;
+  title?: string;
+  description?: string;
+  progress?: number;
+  totalLessons?: number;
+  completedLessons?: number;
+  xpEarned?: number;
+  modulesCount?: number;
+  cover?: string;
+  [key: string]: any;
+};
 
 const TIPS = [
   'Consistency beats intensity — study a little every day rather than cramming.',
-  "You're 68% through Algebra — that last stretch is where champions are made!",
   'Spaced repetition is the most efficient way to move knowledge into long-term memory.',
+  'Reviewing mistakes beats re-reading: it targets exactly what you missed.',
 ];
 
 export default function CoursesScreen() {
   const router = useRouter();
   const { token } = useAuth();
-  const [apiCourses, setApiCourses] = useState<any[] | null>(null);
-  useEffect(() => {
-    if (!token) return;
-    api
-      .get('/courses')
-      .then((r) => {
-        const list = Array.isArray((r.data ?? r)) ? r.data : r.data.courses ?? r.data.data ?? [];
-        if (list.length) setApiCourses(list);
-      })
-      .catch(() => {});
-  }, [token]);
+  const [courses, setCourses] = useState<Course[]>([]);
+  const [status, setStatus] = useState<'loading' | 'error' | 'ready'>('loading');
+  const [error, setError] = useState<string | null>(null);
+  const [tipIdx] = useState(0);
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState<'all' | 'active' | 'done'>('all');
-  const [tipIdx] = useState(0);
+
+  const load = useCallback(async () => {
+    if (!token) return;
+    setStatus('loading');
+    setError(null);
+    try {
+      const r: any = await api.get('/mobile/courses');
+      const d = r.data ?? r;
+      const list: Course[] = Array.isArray(d) ? d : d.courses ?? d.data ?? [];
+      setCourses(list);
+      setStatus('ready');
+    } catch (e) {
+      setError(errorMessage(e));
+      setCourses([]);
+      setStatus('error');
+    }
+  }, [token]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
 
   const filtered = useMemo(() => {
-    let list = [...(apiCourses ?? MOCK)];
-    if (search) list = list.filter((c) => c.name.toLowerCase().includes(search.toLowerCase()));
-    if (filter === 'active') list = list.filter((c) => c.progress > 0 && c.progress < 100);
-    if (filter === 'done') list = list.filter((c) => c.progress >= 100);
+    let list = [...courses];
+    if (search) list = list.filter((c) => (c.name ?? c.title ?? '').toLowerCase().includes(search.toLowerCase()));
+    if (filter === 'active') list = list.filter((c) => (c.progress ?? 0) > 0 && (c.progress ?? 0) < 100);
+    if (filter === 'done') list = list.filter((c) => (c.progress ?? 0) >= 100);
     return list;
-  }, [search, filter, apiCourses]);
+  }, [search, filter, courses]);
 
   return (
     <SafeAreaView style={styles.safe} edges={['top']}>
@@ -66,7 +83,7 @@ export default function CoursesScreen() {
               <View style={styles.tipIcon}><Text style={{ fontSize: 12 }}>✨</Text></View>
               <Text style={styles.tipLabel}>Daily Insight</Text>
             </View>
-            <Text style={styles.tipText}>"{TIPS[tipIdx]}"</Text>
+            <Text style={styles.tipText}>{TIPS[tipIdx]}</Text>
             <View style={styles.tipActions}>
               <TouchableOpacity style={styles.tipBtn}><Text style={styles.tipBtnText}>Got it</Text></TouchableOpacity>
               <View style={{ flex: 1, height: 1, backgroundColor: '#EAE5DE' }} />
@@ -91,29 +108,45 @@ export default function CoursesScreen() {
             <Text style={styles.countText}>{filtered.length} courses</Text>
           </View>
 
-          {filtered.map((c) => (
-            <TouchableOpacity key={c.id} onPress={() => router.push(`/courses/${c.id}` as any)} style={styles.courseCard}>
-              {c.cover ? <Image source={{ uri: c.cover }} style={styles.cover} /> : <View style={[styles.cover, styles.coverFallback]}><Ionicons name="book-outline" size={32} color="#D96A3E" /></View>}
-              <View style={styles.courseBody}>
-                <View style={styles.badgeRow}>
-                  <View style={[styles.pctBadge, c.progress >= 100 && { backgroundColor: '#10B981' }]}>
-                    <Text style={styles.pctText}>{c.progress >= 100 ? '✓ Done' : `${c.progress}%`}</Text>
+          {status === 'error' ? (
+            <View style={{ alignItems: 'center', gap: 8, paddingVertical: 32 }}>
+              <Ionicons name="cloud-offline-outline" size={32} color="#8A8A8A" />
+              <Text style={{ fontSize: 12, color: '#6B7280' }}>{error}</Text>
+              <TouchableOpacity style={styles.retryBtn} onPress={load}><Text style={styles.retryText}>Try again</Text></TouchableOpacity>
+            </View>
+          ) : (
+            filtered.map((c) => (
+              <TouchableOpacity key={c.id} onPress={() => router.push(`/courses/${c.id}` as any)} style={styles.courseCard}>
+                {c.cover ? <Image source={{ uri: c.cover }} style={styles.cover} /> : <View style={[styles.cover, styles.coverFallback]}><Ionicons name="book-outline" size={32} color="#D96A3E" /></View>}
+                <View style={styles.courseBody}>
+                  <View style={styles.badgeRow}>
+                    <View style={[styles.pctBadge, (c.progress ?? 0) >= 100 && { backgroundColor: '#10B981' }]}>
+                      <Text style={styles.pctText}>{(c.progress ?? 0) >= 100 ? '✓ Done' : `${c.progress ?? 0}%`}</Text>
+                    </View>
                   </View>
+                  <Text style={styles.courseName}>{c.name ?? c.title}</Text>
+                  {!!c.description && <Text style={styles.courseDesc} numberOfLines={2}>{c.description}</Text>}
+                  <View style={styles.metaRow}>
+                    {c.modulesCount != null && (
+                      <View style={styles.metaItem}><Ionicons name="layers-outline" size={12} color="#6B7280" /><Text style={styles.metaText}>{c.modulesCount} modules</Text></View>
+                    )}
+                    {c.totalLessons != null && (
+                      <View style={styles.metaItem}><Ionicons name="bar-chart-outline" size={12} color="#6B7280" /><Text style={styles.metaText}>{c.completedLessons ?? 0}/{c.totalLessons}</Text></View>
+                    )}
+                    <Ionicons name="chevron-forward" size={16} color="#9AA0A6" />
+                  </View>
+                  <View style={styles.progressBg}><View style={[styles.progressFg, { width: `${c.progress ?? 0}%`, backgroundColor: (c.progress ?? 0) >= 100 ? '#10B981' : '#D96A3E' }]} /></View>
                 </View>
-                <Text style={styles.courseName}>{c.name}</Text>
-                <Text style={styles.courseDesc} numberOfLines={2}>{c.description}</Text>
-                <View style={styles.metaRow}>
-                  <View style={styles.metaItem}><Ionicons name="layers-outline" size={12} color="#6B7280" /><Text style={styles.metaText}>{c.modulesCount} modules</Text></View>
-                  <View style={styles.metaItem}><Ionicons name="bar-chart-outline" size={12} color="#6B7280" /><Text style={styles.metaText}>{c.completedLessons}/{c.totalLessons}</Text></View>
-                  <Ionicons name="chevron-forward" size={16} color="#9AA0A6" />
-                </View>
-                <View style={styles.progressBg}><View style={[styles.progressFg, { width: `${c.progress}%`, backgroundColor: c.progress >= 100 ? '#10B981' : '#D96A3E' }]} /></View>
-              </View>
-            </TouchableOpacity>
-          ))}
+              </TouchableOpacity>
+            ))
+          )}
 
-          {filtered.length === 0 && (
-            <View style={styles.empty}><Ionicons name="search-outline" size={32} color="#9AA0A6" /><Text style={styles.emptyTitle}>No matches found</Text><Text style={styles.emptySub}>Try a different search or filter.</Text></View>
+          {status === 'ready' && filtered.length === 0 && (
+            <View style={styles.empty}>
+              <Ionicons name="search-outline" size={32} color="#9AA0A6" />
+              <Text style={styles.emptyTitle}>{search || filter !== 'all' ? 'No matches found' : 'No courses yet'}</Text>
+              <Text style={styles.emptySub}>{search || filter !== 'all' ? 'Try a different search or filter.' : 'Courses your teacher assigns will appear here.'}</Text>
+            </View>
           )}
         </ScrollView>
       </View>
@@ -122,6 +155,8 @@ export default function CoursesScreen() {
 }
 
 const styles = StyleSheet.create({
+  retryBtn: { backgroundColor: '#1A1E22', borderRadius: 10, paddingHorizontal: 20, paddingVertical: 10, marginTop: 4 },
+  retryText: { color: '#fff', fontSize: 12, fontWeight: '700' },
   safe: { flex: 1, backgroundColor: '#FDFBF6' },
   webWrap: { flex: 1, width: '100%', maxWidth: 480, alignSelf: 'center' },
   header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 14, paddingVertical: 12, backgroundColor: '#FDFBF6' },

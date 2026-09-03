@@ -1,133 +1,389 @@
-// @ts-nocheck
 import { Ionicons } from '@expo/vector-icons';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { useEffect, useRef, useState } from 'react';
+import * as Linking from 'expo-linking';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Modal, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { api, errorMessage, webLink } from '@/lib/api';
+import { fmtTime, parseDate } from '@/lib/format';
+import { PageSkeleton } from '@/components/PageSkeleton';
 
-// Mirrors C:\luav6\resources\js\pages\Exams\Show.vue logic (server deadline, autosave, flags, submit, review)
-type QType = 'multiple_choice' | 'true_false' | 'identification' | 'essay' | 'enumeration' | 'matching';
+// ---------------------------------------------------------------------------
+// Real exam flow against the LUA V6 mobile API (routes/api.php → /api/mobile):
+//   GET  /mobile/exams/{id}                    → exam{parts, is_open_now,...} + submissions + partDeadlines + answerDrafts + xpAward
+//   POST /mobile/exams/{id}/parts/{p}/start    → {started_at, deadline} (authoritative clock)
+//   PUT  /mobile/exams/{id}/parts/{p}/answers  → autosave {answers: [{question_number, answer}]}
+//   POST /mobile/exams/{id}/parts/{p}/submit   → {submitted_part}
+//   POST /mobile/exams/{id}/parts/{p}/status   → grading status + xp_award
+//   GET  /mobile/exams/{id}/review             → per-question results once the exam is closed (403 before)
+// The client keys answers by 0-based question index (UI); the server keys by
+// 1-based question_number, so every payload goes through toAnswerList().
+// ---------------------------------------------------------------------------
+const ENDPOINTS = {
+  show: (id: string | number) => `/mobile/exams/${id}`,
+  startPart: (id: string | number, partId: number) => `/mobile/exams/${id}/parts/${partId}/start`,
+  saveAnswers: (id: string | number, partId: number) => `/mobile/exams/${id}/parts/${partId}/answers`,
+  submitPart: (id: string | number, partId: number) => `/mobile/exams/${id}/parts/${partId}/submit`,
+  partStatus: (id: string | number, partId: number) => `/mobile/exams/${id}/parts/${partId}/status`,
+  review: (id: string | number) => `/mobile/exams/${id}/review`,
+};
 
 type Question = {
+  id?: number;
   text: string;
-  type: QType;
+  type: 'multiple_choice' | 'true_false' | 'identification' | 'essay' | 'enumeration' | 'matching';
   options?: { text: string; is_correct?: boolean }[] | null;
   points: number;
   correct_answer?: string | null;
   enumeration_items?: { points: number }[] | null;
   matching_items?: { index: number; prompt: string; points: number }[] | null;
   matching_options?: { value: string; text: string }[] | null;
+  feedback?: string | null;
 };
 
-type Part = { id: number; title: string; instructions: string | null; points: number; questions: Question[] };
+type Part = {
+  id: number;
+  title: string;
+  instructions?: string | null;
+  points: number;
+  questions: Question[];
+  submitted?: boolean;
+  is_submitted?: boolean;
+  answers?: Record<number, any>;
+  user_answers?: Record<number, any>;
+  score?: number | null;
+  submissionStatus?: string | null;
+  [key: string]: any;
+};
 
-const MOCK_PARTS: Part[] = [
-  {
-    id: 1,
-    title: 'Part A — Multiple Choice',
-    instructions: 'Choose the best answer. Flag questions to review later.',
-    points: 30,
-    questions: [
-      { text: 'What is the solution to 2x + 3 = 11?', type: 'multiple_choice', points: 10, options: [{ text: 'x = 3' }, { text: 'x = 4', is_correct: true }, { text: 'x = 5' }, { text: 'x = 6' }] },
-      { text: 'True or False: The slope of y = 2x + 1 is 2.', type: 'true_false', points: 5, options: [{ text: 'True', is_correct: true }, { text: 'False' }] },
-      { text: 'Define “linear equation” in one sentence.', type: 'essay', points: 15 },
-    ],
-  },
-  {
-    id: 2,
-    title: 'Part B — Identification & Enumeration',
-    instructions: 'Fill in the required items. All blanks required.',
-    points: 20,
-    questions: [
-      { text: 'What is the capital of France?', type: 'identification', points: 5, correct_answer: 'Paris' },
-      { text: 'List 3 prime numbers under 10', type: 'enumeration', points: 9, enumeration_items: [{ points: 3 }, { points: 3 }, { points: 3 }] },
-      { text: 'Match the term to its definition', type: 'matching', points: 6, matching_items: [{ index: 0, prompt: 'Slope', points: 3 }, { index: 1, prompt: 'Intercept', points: 3 }], matching_options: [{ value: 'm', text: 'Rise/Run' }, { value: 'b', text: 'Where line crosses y-axis' }] },
-    ],
-  },
-];
+type SaveState = 'idle' | 'saving' | 'saved' | 'error';
+
+const partSubmitted = (p: Part) => Boolean(p.submitted ?? p.is_submitted);
+
+// The client keys answers by 0-based question index (UI); the server expects
+// 1-based question_number entries (SaveExamAnswersRequest / SubmitExamPartRequest).
+const toAnswerList = (rec: Record<number, any>) =>
+  Object.entries(rec)
+    .filter(([, v]) => v !== undefined)
+    .map(([i, v]) => ({ question_number: Number(i) + 1, answer: v ?? null }));
+
+// Server draft shape: [{question_number, answer}] → 0-based client record.
+const draftToRecord = (list: any[]): Record<number, any> => {
+  const rec: Record<number, any> = {};
+  for (const a of list ?? []) {
+    const n = Number(a?.question_number);
+    if (!Number.isFinite(n) || n < 1) continue;
+    rec[n - 1] = a.answer ?? null;
+  }
+  return rec;
+};
 
 export default function ExamTakeScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const router = useRouter();
 
-  const examTitle = `Mathematics Midterm`;
-  const duration = 45 * 60; // 45 min
-  const [selectedPart, setSelectedPart] = useState<Part | null>(null);
+  const [exam, setExam] = useState<any>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [parts, setParts] = useState<Part[]>([]);
+  const [activeIdx, setActiveIdx] = useState<number | null>(null); // index into parts
+  const [pendingIdx, setPendingIdx] = useState<number | null>(null); // start modal
   const [showStartModal, setShowStartModal] = useState(false);
-  const [pendingPart, setPendingPart] = useState<Part | null>(null);
-  const [examStarted, setExamStarted] = useState(false);
-  const [answers, setAnswers] = useState<Record<number, any>>({});
+  const [answers, setAnswers] = useState<Record<number, any>>({}); // keyed by question index in active part
   const [flagged, setFlagged] = useState<Set<number>>(new Set());
   const [mobileIndex, setMobileIndex] = useState(0);
-  const [timeLeft, setTimeLeft] = useState(duration);
-  const [answerState, setAnswerState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [deadlineMs, setDeadlineMs] = useState<number | null>(null);
+  const [timeLeft, setTimeLeft] = useState(0);
+  const [saveState, setSaveState] = useState<SaveState>('idle');
   const [submittedParts, setSubmittedParts] = useState<Set<number>>(new Set());
+  const [submitting, setSubmitting] = useState(false);
   const [showUnansweredWarn, setShowUnansweredWarn] = useState(false);
   const [pendingSubmit, setPendingSubmit] = useState(false);
   const [showSuccess, setShowSuccess] = useState(false);
-  const [showXpModal, setShowXpModal] = useState(false);
-  const [xpAward, setXpAward] = useState<{ total: number; completion: number; accuracy: number } | null>(null);
+  const [showDone, setShowDone] = useState(false);
+  const [xpAward, setXpAward] = useState<{ completion_xp: number; accuracy_xp: number; on_time_xp: number; total_xp: number; accuracy_pending?: boolean } | null>(null);
+  const [lastPartStatus, setLastPartStatus] = useState<any>(null);
+  // Authoritative server state from GET /mobile/exams/{id}: per-part active
+  // deadlines, DB-persisted answer drafts, and the user's submissions.
+  const serverStateRef = useRef<{
+    partDeadlines: Record<string, string | null>;
+    answerDrafts: Record<string, { answers: any[] }>;
+    submissions: Record<string, any>;
+  }>({ partDeadlines: {}, answerDrafts: {}, submissions: {} });
+  // Review data (fetched after the exam closes): partId → 0-based answers + score.
+  const [reviewByPart, setReviewByPart] = useState<Record<number, { answers: Record<number, any>; score: number | null; status: string | null }>>({});
 
-  const isPartSubmitted = (pid: number) => submittedParts.has(pid);
-  const isPartLocked = (idx: number) => {
-    if (idx === 0) return false;
-    return !isPartSubmitted(MOCK_PARTS[idx - 1].id);
+  const examId = Number(id);
+  const examTitle = exam?.title ?? exam?.name ?? 'Exam';
+  const examClosed = exam?.is_open_now === false;
+  const examIsLocked =
+    (parts.length > 0 && submittedParts.size >= parts.length) || (examClosed && submittedParts.size > 0);
+  const activePart = activeIdx != null ? parts[activeIdx] : null;
+
+  // ---------------------------------------------------------------- load
+  const loadExam = useCallback(async () => {
+    if (!id) return;
+    setLoadError(null);
+    setLoaded(false);
+    try {
+      const r: any = await api.get(ENDPOINTS.show(id));
+      const data = r.data ?? r;
+      const examData = data.exam ?? data;
+      setExam(examData);
+      const ps: Part[] = (examData.parts ?? data.parts ?? []).filter((p: any) => p && Array.isArray(p.questions));
+      setParts(ps);
+      const subs: Record<string, any> = data.submissions ?? {};
+      setSubmittedParts(new Set(ps.filter((p) => subs[String(p.id)]?.status).map((p) => p.id)));
+      serverStateRef.current = {
+        partDeadlines: data.partDeadlines ?? {},
+        answerDrafts: data.answerDrafts ?? {},
+        submissions: subs,
+      };
+      if (data.xpAward) setXpAward({ ...data.xpAward });
+      setLoaded(true);
+      // Once the exam is closed, results unlock — fetch the review payload for
+      // per-question answers and scores. 403 means it's still open; stay honest.
+      if (examData.is_open_now === false) {
+        api
+          .get(ENDPOINTS.review(id))
+          .then((rv: any) => {
+            const rd = rv.data ?? rv;
+            const byPart: Record<number, { answers: Record<number, any>; score: number | null; status: string | null }> = {};
+            for (const sub of rd.submissions ?? []) {
+              const pid = Number(sub.exam_part_id);
+              if (!pid) continue;
+              byPart[pid] = { answers: draftToRecord(sub.answers ?? []), score: sub.score ?? null, status: sub.status ?? null };
+            }
+            setReviewByPart(byPart);
+          })
+          .catch(() => {
+            /* review still sealed — nothing to show yet */
+          });
+      }
+    } catch (e) {
+      setLoadError(errorMessage(e));
+      setLoaded(true);
+    }
+  }, [id]);
+
+  useEffect(() => {
+    loadExam();
+  }, [loadExam]);
+
+  // ----------------------------------------------------------- deadline
+  const computeDeadline = useCallback((): number | null => {
+    if (!exam) return null;
+    const explicit = parseDate(exam.deadline_iso ?? exam.deadline ?? exam.ends_at_iso ?? exam.ends_at);
+    if (explicit) return explicit.getTime();
+    const durationMin: number = Number(exam.duration_minutes ?? exam.duration ?? 0);
+    if (durationMin > 0) {
+      const start = parseDate(exam.starts_at_iso ?? exam.starts_at ?? exam.exam_date_iso);
+      const base = start && start.getTime() > Date.now() ? start.getTime() : Date.now();
+      return base + durationMin * 60000;
+    }
+    return null;
+  }, [exam]);
+
+  useEffect(() => {
+    if (loaded && !examIsLocked) {
+      const d = computeDeadline();
+      setDeadlineMs(d);
+      if (d) setTimeLeft(Math.max(0, Math.floor((d - Date.now()) / 1000)));
+    }
+  }, [loaded, examIsLocked, computeDeadline]);
+
+  // 1s tick (drift-safe: always derived from the deadline, not decremented)
+  useEffect(() => {
+    if (activeIdx == null || !deadlineMs) return;
+    const tick = () => {
+      const left = Math.max(0, Math.floor((deadlineMs - Date.now()) / 1000));
+      setTimeLeft(left);
+    };
+    tick();
+    const t = setInterval(tick, 1000);
+    return () => clearInterval(t);
+  }, [activeIdx, deadlineMs]);
+
+  // ------------------------------------------------------------ answers
+  const setAnswer = (qIdx: number, value: any) => {
+    setAnswers((prev) => ({ ...prev, [qIdx]: value }));
   };
 
-  // Timer - mirrors Show.vue startTimer() + applyDeadline() + auto-submit
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  useEffect(() => {
-    if (!examStarted || !selectedPart) return;
-    if (timerRef.current) clearInterval(timerRef.current);
-    setTimeLeft(duration);
-    timerRef.current = setInterval(() => {
-      setTimeLeft((t) => {
-        if (t <= 1) {
-          if (timerRef.current) clearInterval(timerRef.current);
-          // auto-submit on timeout
-          setTimeout(() => handleSubmitPart(true), 300);
-          return 0;
-        }
-        return t - 1;
-      });
-    }, 1000);
-    return () => {
-      if (timerRef.current) clearInterval(timerRef.current);
-    };
-  }, [examStarted, selectedPart?.id]);
-
-  // Autosave pulse - mirrors persistQueuedAnswers + saveDraft every 500ms
-  useEffect(() => {
-    if (!examStarted || !selectedPart) return;
-    setAnswerState('saving');
-    const t = setTimeout(() => setAnswerState('saved'), 600);
-    return () => clearTimeout(t);
-  }, [answers]);
-
-  const fmtTime = (s: number) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
-  const answeredCount = Object.values(answers).filter((v) => v !== undefined && v !== null && String(v).trim() !== '' && !(Array.isArray(v) && v.some((x) => !String(x).trim()))).length;
-  const totalQ = selectedPart?.questions?.length ?? 0;
+  const answeredCount = useMemo(() => {
+    if (!activePart) return 0;
+    return activePart.questions.filter((q, i) => {
+      const v = answers[i];
+      if (v === undefined || v === null) return false;
+      if (typeof v === 'string') return v.trim() !== '';
+      if (Array.isArray(v)) return v.some((x) => String(x ?? '').trim() !== '');
+      if (typeof v === 'object') return Object.values(v).some((x) => String(x ?? '').trim() !== '');
+      return true;
+    }).length;
+  }, [activePart, answers]);
+  const totalQ = activePart?.questions?.length ?? 0;
   const unanswered = totalQ - answeredCount;
   const progressPct = totalQ ? (answeredCount / totalQ) * 100 : 0;
 
-  const onSelectPart = (part: Part, idx: number) => {
-    if (isPartSubmitted(part.id) || isPartLocked(idx)) return;
-    setPendingPart(part);
-    setShowStartModal(true);
+  // --------------------------------------------------------- autosave
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastSaved = useRef<{ partId: number; answers: Record<number, any> } | null>(null);
+  const partActiveRef = useRef(false);
+  partActiveRef.current = activeIdx != null && !examIsLocked;
+
+  useEffect(() => {
+    if (activeIdx == null || examIsLocked) return;
+    const part = parts[activeIdx];
+    if (!part) return;
+    if (Object.keys(answers).length === 0) {
+      setSaveState('idle'); // server requires at least one answer; nothing to save yet
+      return;
+    }
+    setSaveState('saving');
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(async () => {
+      try {
+        await api.put(ENDPOINTS.saveAnswers(examId, part.id), { answers: toAnswerList(answers) });
+        lastSaved.current = { partId: part.id, answers };
+        setSaveState('saved');
+      } catch {
+        setSaveState('error'); // surfaced in the save indicator; retried on next change
+      }
+    }, 1500);
+    return () => {
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- parts[activeIdx] is stable for a session
+  }, [answers, activeIdx, examIsLocked, examId]);
+
+  // Best-effort final save on unmount (mirrors Show.vue persistQueuedAnswers):
+  // flush the active part's latest answers if they differ from the last save.
+  const activeIdxRef = useRef<number | null>(null);
+  const answersRef = useRef<Record<number, any>>({});
+  activeIdxRef.current = activeIdx;
+  answersRef.current = answers;
+  useEffect(() => {
+    return () => {
+      if (!partActiveRef.current) return;
+      const idx = activeIdxRef.current;
+      if (idx == null || idx >= parts.length) return;
+      const part = parts[idx];
+      const current = answersRef.current;
+      const last = lastSaved.current;
+      if (!part || Object.keys(current).length === 0) return;
+      if (last && last.partId === part.id && JSON.stringify(last.answers) === JSON.stringify(current)) return;
+      api.put(ENDPOINTS.saveAnswers(examId, part.id), { answers: toAnswerList(current) }).catch(() => {});
+    };
+  }, [parts, examId]);
+
+  // -------------------------------------------------------- part start
+  const isPartLocked = (idx: number) => {
+    if (idx === 0) return false;
+    return !isPartSubmitted(parts[idx - 1]?.id);
+  };
+  const isPartSubmitted = (partId: number) => submittedParts.has(partId);
+
+  const onSelectPart = (idx: number) => {
+    if (activeIdx == null) {
+      // Part picker → start modal
+      if (isPartSubmitted(parts[idx]?.id) || isPartLocked(idx)) return;
+      setPendingIdx(idx);
+      setShowStartModal(true);
+    }
   };
 
-  const confirmStart = async () => {
-    if (!pendingPart) return;
-    // Mirrors reEnterFullscreen() + startServerClock() - mobile: no fullscreen, just start
-    setSelectedPart(pendingPart);
-    setAnswers({});
+  const confirmStart = () => {
+    if (pendingIdx == null) return;
+    const part = parts[pendingIdx];
+    // Seed with the DB-persisted draft from the show payload (survives reloads).
+    const draft = serverStateRef.current.answerDrafts[String(part.id)]?.answers;
+    const prev = Array.isArray(draft) ? draftToRecord(draft) : {};
+    setAnswers({ ...prev });
     setFlagged(new Set());
     setMobileIndex(0);
-    setExamStarted(true);
+    setActiveIdx(pendingIdx);
+    setPendingIdx(null);
     setShowStartModal(false);
-    // pretend server anchors deadline
-    setTimeLeft(duration);
+    setSaveState('idle');
+    // Prefer the server's active per-part deadline; fall back to the exam clock.
+    const serverDeadline = parseDate(serverStateRef.current.partDeadlines[String(part.id)] ?? '');
+    const d = serverDeadline ? serverDeadline.getTime() : computeDeadline();
+    setDeadlineMs(d);
+    if (d) setTimeLeft(Math.max(0, Math.floor((d - Date.now()) / 1000)));
+    // Start (or resume) the server-side clock — it is authoritative and cannot
+    // be reset by reloading. Best-effort: the local countdown keeps running.
+    api
+      .post(ENDPOINTS.startPart(examId, part.id))
+      .then((sr: any) => {
+        const dd = parseDate(sr?.deadline);
+        if (dd) {
+          setDeadlineMs(dd.getTime());
+          setTimeLeft(Math.max(0, Math.floor((dd.getTime() - Date.now()) / 1000)));
+        }
+      })
+      .catch(() => {});
   };
+
+  // -------------------------------------------------------- submit part
+  const submitPart = useCallback(
+    async (isTimeout: boolean) => {
+      const idx = activeIdx;
+      if (idx == null || submitting) return;
+      const part = parts[idx];
+      if (!part || isPartSubmitted(part.id)) return;
+      if (!isTimeout && unanswered > 0 && !pendingSubmit) {
+        setShowUnansweredWarn(true);
+        return;
+      }
+      setShowUnansweredWarn(false);
+      setPendingSubmit(false);
+      setSubmitting(true);
+      try {
+        // Save answers right before submitting so nothing is lost.
+        try {
+          if (Object.keys(answers).length > 0) {
+            await api.put(ENDPOINTS.saveAnswers(examId, part.id), { answers: toAnswerList(answers) });
+          }
+        } catch {
+          /* submit endpoint is the source of truth */
+        }
+        await api.post(ENDPOINTS.submitPart(examId, part.id), { answers: toAnswerList(answers) });
+        const newSubmitted = new Set(submittedParts);
+        newSubmitted.add(part.id);
+        setSubmittedParts(newSubmitted);
+        // Essays grade asynchronously — partStatus reports the honest state
+        // and the current XP award for this submission.
+        const st: any = await api.post(ENDPOINTS.partStatus(examId, part.id)).catch(() => null);
+        setLastPartStatus(st ?? null);
+        if (st?.xp_award && typeof st.xp_award === 'object') setXpAward({ ...st.xp_award });
+        setShowSuccess(true);
+        if (newSubmitted.size >= parts.length) {
+          setTimeout(() => {
+            setShowSuccess(false);
+            setShowDone(true);
+          }, 1400);
+        }
+        setActiveIdx(null);
+      } catch (e) {
+        if (!isTimeout) {
+          Alert.alert('Submit failed', errorMessage(e), [
+            { text: 'OK' },
+          ]);
+        }
+      } finally {
+        setSubmitting(false);
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeIdx, submitting, parts, examId, answers, unanswered, pendingSubmit, submittedParts]
+  );
+
+  // Auto-submit on timeout
+  useEffect(() => {
+    if (timeLeft === 0 && activeIdx != null && deadlineMs && !examIsLocked) {
+      submitPart(true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- fire exactly once at zero
+  }, [timeLeft]);
 
   const toggleFlag = (idx: number) => {
     setFlagged((prev) => {
@@ -138,118 +394,152 @@ export default function ExamTakeScreen() {
     });
   };
 
-  const handleSubmitPart = (isTimeout = false) => {
-    if (!selectedPart) return;
-    if (!isTimeout && unanswered > 0 && !pendingSubmit) {
-      setShowUnansweredWarn(true);
-      return;
-    }
-    // Simulate PUT /exams/{exam}/parts/{part}/answers + POST submit
-    setPendingSubmit(false);
-    setShowUnansweredWarn(false);
-    const newSubmitted = new Set(submittedParts);
-    newSubmitted.add(selectedPart.id);
-    setSubmittedParts(newSubmitted);
+  // ---------------------------------------------------------------- render
+  if (!loaded) {
+    return (
+      <SafeAreaView style={styles.safe} edges={['top']}>
+        <View style={styles.webWrap}><View style={styles.headerPlaceholder} /><PageSkeleton count={5} /></View>
+      </SafeAreaView>
+    );
+  }
 
-    // Show success + XP (mirrors showSuccessModal + showXpModal + xpAward)
-    setShowSuccess(true);
-    setTimeout(() => {
-      setShowSuccess(false);
-      if (newSubmitted.size === MOCK_PARTS.length) {
-        // all parts done -> XP award
-        setXpAward({ total: 85, completion: 30, accuracy: 45 });
-        setShowXpModal(true);
-      } else {
-        // back to list view for next part
-        setSelectedPart(null);
-        setExamStarted(false);
-      }
-    }, 1200);
-  };
-
-  const isAllDone = submittedParts.size === MOCK_PARTS.length;
-
-  // --- List view (select part) ---
-  if (!selectedPart) {
+  if (loadError) {
     return (
       <SafeAreaView style={styles.safe} edges={['top']}>
         <View style={styles.webWrap}>
-          <View style={styles.header}>
-            <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}><Ionicons name="chevron-back" size={20} color="#1A1E22" /></TouchableOpacity>
-            <Text style={styles.headerTitle} numberOfLines={1}>Exam #{id} · {examTitle}</Text>
-            <View style={{ width: 36 }} />
+          <Header title="Exam" onBack={() => router.back()} />
+          <View style={styles.errorWrap}>
+            <View style={styles.errorIcon}><Ionicons name="cloud-offline-outline" size={30} color="#8A8A8A" /></View>
+            <Text style={styles.errorTitle}>Couldn&apos;t load this exam</Text>
+            <Text style={styles.errorText}>{loadError}</Text>
+            <TouchableOpacity style={styles.retryBtn} onPress={loadExam}><Text style={styles.retryText}>Try again</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.webLinkBtn} onPress={() => Linking.openURL(webLink(`/exams/${id}`))}>
+              <Text style={styles.webLinkText}>Open in web app</Text>
+            </TouchableOpacity>
           </View>
+        </View>
+      </SafeAreaView>
+    );
+  }
 
+  // ------------------------------------------------------------ REVIEW
+  if (examIsLocked) {
+    return (
+      <SafeAreaView style={styles.safe} edges={['top']}>
+        <View style={styles.webWrap}>
+          <Header title={examTitle} onBack={() => router.back()} />
           <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
-            <View style={styles.examHero}>
-              <Text style={styles.heroTitle}>{examTitle}</Text>
-              <Text style={styles.heroSub}>45 min · 2 parts · {MOCK_PARTS.reduce((s, p) => s + (p.questions?.length ?? 0), 0)} questions</Text>
-              <View style={styles.heroProgress}><View style={[styles.heroProgressFg, { width: `${(submittedParts.size / MOCK_PARTS.length) * 100}%` }]} /></View>
-              <Text style={styles.heroProgressText}>{submittedParts.size}/{MOCK_PARTS.length} parts submitted</Text>
+            <View style={styles.reviewBanner}>
+              <Ionicons name="checkmark-circle" size={18} color="#3A7D5C" />
+              <Text style={styles.reviewBannerText}>
+                {parts.length > 0 && submittedParts.size >= parts.length
+                  ? 'This exam is submitted — you’re viewing your results.'
+                  : 'This exam has closed — you’re viewing your submitted results.'}
+              </Text>
             </View>
+            {parts.length === 0 && (
+              <View style={styles.emptyBox}>
+                <Text style={styles.emptyText}>
+                  Detailed per-question results aren&apos;t available in the API response. Review the full breakdown in the web app.
+                </Text>
+                <TouchableOpacity style={styles.webLinkBtn} onPress={() => Linking.openURL(webLink(`/exams/${id}`))}>
+                  <Text style={styles.webLinkText}>Full review in web app</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+            {parts.map((p, pIdx) => (
+              <PartReview
+                key={p.id}
+                part={{
+                  ...p,
+                  answers: reviewByPart[p.id]?.answers ?? p.answers,
+                  score: reviewByPart[p.id]?.score ?? null,
+                  submissionStatus: reviewByPart[p.id]?.status ?? null,
+                }}
+                index={pIdx + 1}
+              />
+            ))}
+          </ScrollView>
+        </View>
+      </SafeAreaView>
+    );
+  }
 
-            {isAllDone ? (
-              <View style={styles.doneCard}>
-                <Ionicons name="checkmark-circle" size={48} color="#10B981" />
-                <Text style={styles.doneTitle}>All parts submitted</Text>
-                <Text style={styles.doneSub}>Results will unlock once your teacher closes the exam.</Text>
-                <TouchableOpacity onPress={() => router.replace('/(tabs)/exams' as any)} style={styles.primaryBtn}><Text style={styles.primaryText}>Back to exams</Text></TouchableOpacity>
+  // ------------------------------------------------------------- PICKER
+  if (activeIdx == null) {
+    const allDone = parts.length > 0 && parts.every((p) => isPartSubmitted(p.id));
+    return (
+      <SafeAreaView style={styles.safe} edges={['top']}>
+        <View style={styles.webWrap}>
+          <Header title={examTitle} onBack={() => router.back()} />
+          <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
+            <View style={styles.examMeta}>
+              <View style={styles.metaChip}><Ionicons name="time-outline" size={13} color="#6B7280" /><Text style={styles.metaChipText}>{exam?.duration_minutes ?? '—'} min total</Text></View>
+              <View style={styles.metaChip}><Ionicons name="document-text-outline" size={13} color="#6B7280" /><Text style={styles.metaChipText}>{parts.length} parts · {parts.reduce((n, p) => n + (p.points ?? 0), 0)} pts</Text></View>
+              {deadlineMs && (
+                <View style={styles.metaChip}><Ionicons name="alarm-outline" size={13} color="#D96A3E" /><Text style={[styles.metaChipText, { color: '#D96A3E' }]}>Ends {parseDate(deadlineMs)?.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</Text></View>
+              )}
+            </View>
+            <Text style={styles.sectionTitle}>Parts</Text>
+            {parts.length === 0 ? (
+              <View style={styles.emptyBox}>
+                <Text style={styles.emptyText}>
+                  This exam has no answerable parts (yet). The teacher may still be publishing it — check back soon, or open it in the web app.
+                </Text>
+                <TouchableOpacity style={styles.webLinkBtn} onPress={() => Linking.openURL(webLink(`/exams/${id}`))}>
+                  <Text style={styles.webLinkText}>Open in web app</Text>
+                </TouchableOpacity>
               </View>
             ) : (
-              MOCK_PARTS.map((part, idx) => {
-                const done = isPartSubmitted(part.id);
+              parts.map((p, idx) => {
+                const submitted = isPartSubmitted(p.id);
                 const locked = isPartLocked(idx);
+                const disabled = submitted || locked;
                 return (
-                  <TouchableOpacity key={part.id} onPress={() => onSelectPart(part, idx)} disabled={done || locked} style={[styles.partCard, done && { opacity: 0.6, backgroundColor: '#F9F7F4' }, locked && { opacity: 0.5 }]}>
-                    <View style={[styles.partIcon, done ? { backgroundColor: '#10B981' } : locked ? { backgroundColor: '#EAE5DE' } : { backgroundColor: '#1A1E22' }]}>
-                      <Ionicons name={done ? 'checkmark' : locked ? 'lock-closed' : 'play'} size={16} color={done ? '#fff' : locked ? '#6B7280' : '#fff'} />
+                  <TouchableOpacity key={p.id} style={[styles.partCard, disabled && { opacity: 0.6 }]} onPress={() => onSelectPart(idx)}>
+                    <View style={[styles.partNum, submitted ? styles.partNumDone : { backgroundColor: '#FFF0EB' }]}>
+                      {submitted ? <Ionicons name="checkmark" size={16} color="#fff" /> : <Text style={[styles.partNumText, !submitted && { color: '#D96A3E' }]}>{idx + 1}</Text>}
                     </View>
                     <View style={{ flex: 1 }}>
-                      <Text style={styles.partTitle}>{part.title}</Text>
-                      <Text style={styles.partMeta}>{part.questions.length} questions · {part.points} pts {done ? '· Completed' : locked ? '· Locked' : ''}</Text>
-                      {part.instructions && <Text style={styles.partInstr}>{part.instructions}</Text>}
+                      <Text style={styles.partTitle}>{p.title}</Text>
+                      <Text style={styles.partMeta}>{p.questions.length} questions · {p.points} pts {locked && '· starts after part ' + idx}</Text>
                     </View>
-                    {!done && !locked && <Ionicons name="chevron-forward" size={16} color="#9AA0A6" />}
-                    {done && <View style={styles.doneBadge}><Text style={styles.doneBadgeText}>Done</Text></View>}
+                    <View style={submitted ? styles.doneBadge : locked ? styles.lockBadge : styles.openBadge}>
+                      <Text style={submitted ? styles.doneBadgeText : locked ? styles.lockBadgeText : styles.openBadgeText}>
+                        {submitted ? 'Submitted' : locked ? 'Locked' : 'Start'}
+                      </Text>
+                    </View>
                   </TouchableOpacity>
                 );
               })
             )}
-
-            {/* Pre-warm AI hint - mirrors POST exams/pre-warm-ai */}
-            <View style={styles.hintCard}><Ionicons name="sparkles" size={16} color="#D96A3E" /><Text style={styles.hintText}>AI grading pre-warmed · Essay answers auto-scored after submit</Text></View>
+            {allDone && (
+              <TouchableOpacity style={styles.doneCard} onPress={() => setShowDone(true)}>
+                <Ionicons name="trophy" size={20} color="#D96A3E" />
+                <View style={{ flex: 1 }}><Text style={styles.doneCardTitle}>Exam complete</Text><Text style={styles.doneCardSub}>View your summary</Text></View>
+                <Ionicons name="chevron-forward" size={16} color="#1A1E22" />
+              </TouchableOpacity>
+            )}
           </ScrollView>
-
-          {/* Start confirm modal - mirrors showStartModal */}
-          <Modal visible={showStartModal} transparent animationType="fade" onRequestClose={() => setShowStartModal(false)}>
+          {/* Done summary (all parts submitted during this session) */}
+          <Modal visible={showDone} transparent animationType="fade" onRequestClose={() => setShowDone(false)}>
             <View style={styles.modalOverlay}>
               <View style={styles.modalCard}>
-                <View style={styles.modalIcon}><Ionicons name="play-circle" size={28} color="#D96A3E" /></View>
-                <Text style={styles.modalTitle}>Start this part?</Text>
-                <Text style={styles.modalSub}>{pendingPart?.title} · {pendingPart?.questions?.length} questions · {duration / 60} min</Text>
-                <Text style={styles.modalHint}>Timer starts now. Autosave every 2s. Flag questions with F.</Text>
-                <View style={styles.modalRow}>
-                  <TouchableOpacity onPress={() => setShowStartModal(false)} style={styles.modalCancel}><Text style={styles.modalCancelText}>Cancel</Text></TouchableOpacity>
-                  <TouchableOpacity onPress={confirmStart} style={styles.modalConfirm}><Text style={styles.modalConfirmText}>Start</Text></TouchableOpacity>
-                </View>
-              </View>
-            </View>
-          </Modal>
-
-          {/* XP modal - mirrors showXpModal + xpAward */}
-          <Modal visible={showXpModal} transparent animationType="fade" onRequestClose={() => setShowXpModal(false)}>
-            <View style={styles.modalOverlay}>
-              <View style={[styles.modalCard, { alignItems: 'center' }]}>
-                <Ionicons name="trophy" size={40} color="#F59E0B" />
-                <Text style={[styles.modalTitle, { textAlign: 'center' }]}>XP Earned!</Text>
-                {xpAward && (
-                  <View style={{ gap: 6, width: '100%' }}>
-                    <View style={styles.xpRow}><Text style={styles.xpLabel}>Completion</Text><Text style={styles.xpVal}>+{xpAward.completion} XP</Text></View>
-                    <View style={styles.xpRow}><Text style={styles.xpLabel}>Accuracy</Text><Text style={styles.xpVal}>+{xpAward.accuracy} XP</Text></View>
-                    <View style={[styles.xpRow, { borderTopWidth: 1, borderTopColor: '#EAE5DE', paddingTop: 8, marginTop: 4 }]}><Text style={[styles.xpLabel, { fontWeight: '900' }]}>Total</Text><Text style={[styles.xpVal, { color: '#D96A3E' }]}>+{xpAward.total} XP</Text></View>
+                <View style={styles.successIcon}><Ionicons name="checkmark" size={26} color="#fff" /></View>
+                <Text style={styles.modalTitle}>Exam submitted</Text>
+                {xpAward ? (
+                  <View style={styles.xpBox}>
+                    <Text style={styles.xpTotal}>+{xpAward.total_xp} XP</Text>
+                    <Text style={styles.xpSub}>
+                      Completion {xpAward.completion_xp} · Accuracy {xpAward.accuracy_xp}
+                      {xpAward.on_time_xp ? ` · On time ${xpAward.on_time_xp}` : ''}
+                      {xpAward.accuracy_pending ? ' · essays still grading' : ''}
+                    </Text>
                   </View>
+                ) : (
+                  <Text style={styles.modalSub}>All parts submitted. Your results will appear in the Exams tab.</Text>
                 )}
-                <TouchableOpacity onPress={() => { setShowXpModal(false); router.replace('/(tabs)/exams' as any); }} style={[styles.primaryBtn, { width: '100%' }]}><Text style={styles.primaryText}>Continue</Text></TouchableOpacity>
+                <TouchableOpacity style={styles.modalPrimary} onPress={() => router.navigate('/(tabs)/exams')}><Text style={styles.modalPrimaryText}>Back to Exams</Text></TouchableOpacity>
               </View>
             </View>
           </Modal>
@@ -258,118 +548,136 @@ export default function ExamTakeScreen() {
     );
   }
 
-  // --- Taking view ---
-  const q = selectedPart.questions[mobileIndex];
-  const qAnswer = answers[mobileIndex];
-
+  // ------------------------------------------------------------- TAKING
+  const q = activePart?.questions[mobileIndex];
   return (
     <SafeAreaView style={styles.safe} edges={['top']}>
       <View style={styles.webWrap}>
-        {/* Top bar - mirrors timer + progress + integrity */}
         <View style={styles.takeHeader}>
-          <TouchableOpacity onPress={() => { setSelectedPart(null); setExamStarted(false); }} style={styles.backBtn}><Ionicons name="close" size={18} color="#1A1E22" /></TouchableOpacity>
-          <View style={styles.timerPill}><Ionicons name="timer-outline" size={14} color={timeLeft < 120 ? '#EF4444' : '#1A1E22'} /><Text style={[styles.timerText, timeLeft < 120 && { color: '#EF4444' }]}>{fmtTime(timeLeft)}</Text></View>
-          <View style={styles.savePill}><View style={[styles.saveDot, answerState === 'saving' ? { backgroundColor: '#F59E0B' } : answerState === 'saved' ? { backgroundColor: '#10B981' } : answerState === 'error' ? { backgroundColor: '#EF4444' } : { backgroundColor: '#9AA0A6' }]} /><Text style={styles.saveText}>{answerState === 'saving' ? 'Saving...' : answerState === 'saved' ? 'Saved' : answerState === 'error' ? 'Retry' : 'Idle'}</Text></View>
-        </View>
-
-        <View style={styles.progressRow}>
-          <View style={styles.progressBg}><View style={[styles.progressFg, { width: `${progressPct}%` }]} /></View>
-          <Text style={styles.progressText}>{answeredCount}/{totalQ} · {Math.round(progressPct)}%</Text>
-          <TouchableOpacity onPress={() => toggleFlag(mobileIndex)} style={[styles.flagBtn, flagged.has(mobileIndex) && { backgroundColor: '#FFF0EB', borderColor: '#F0C4B0' }]}><Ionicons name={flagged.has(mobileIndex) ? 'flag' : 'flag-outline'} size={14} color={flagged.has(mobileIndex) ? '#D96A3E' : '#6B7280'} /><Text style={[styles.flagText, flagged.has(mobileIndex) && { color: '#D96A3E' }]}>Flag</Text></TouchableOpacity>
-        </View>
-
-        {/* Question navigator dots - mirrors progress navigator */}
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.navRow}>
-          {selectedPart.questions.map((_, i) => {
-            const isAnswered = answers[i] !== undefined && answers[i] !== null && String(answers[i]).trim() !== '' && !(Array.isArray(answers[i]) && answers[i].some((x: string) => !x.trim()));
-            const isFlagged = flagged.has(i);
-            const isActive = i === mobileIndex;
-            return (
-              <TouchableOpacity key={i} onPress={() => setMobileIndex(i)} style={[styles.navDot, isActive && styles.navActive, isFlagged && { borderColor: '#D96A3E', backgroundColor: '#FFF0EB' }, isAnswered && !isActive && { backgroundColor: '#1A1E22', borderColor: '#1A1E22' }]}>
-                <Text style={[styles.navNum, isAnswered && !isActive && { color: '#fff' }, isActive && { color: '#fff' }]}>{i + 1}</Text>
-              </TouchableOpacity>
-            );
-          })}
-        </ScrollView>
-
-        <ScrollView contentContainerStyle={styles.qContent} showsVerticalScrollIndicator={false}>
-          <Text style={styles.qType}>{q.type.replace('_', ' ')} · {q.points} pts</Text>
-          <Text style={styles.qText}>{mobileIndex + 1}. {q.text}</Text>
-
-          {q.type === 'multiple_choice' || q.type === 'true_false' ? (
-            <View style={{ gap: 10 }}>
-              {q.options?.map((opt, oi) => (
-                <TouchableOpacity key={oi} onPress={() => setAnswers({ ...answers, [mobileIndex]: oi })} style={[styles.opt, qAnswer === oi && styles.optSelected]}>
-                  <View style={[styles.radio, qAnswer === oi && styles.radioSel]}>{qAnswer === oi && <View style={styles.radioDot} />}</View>
-                  <Text style={styles.optText}>{opt.text}</Text>
-                </TouchableOpacity>
-              ))}
-              <Text style={styles.kbHint}>Press 1-4 to select · F to flag</Text>
+          <TouchableOpacity onPress={() => setActiveIdx(null)} style={styles.backBtn}><Ionicons name="chevron-back" size={18} color="#1A1E22" /></TouchableOpacity>
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text style={styles.takeTitle} numberOfLines={1}>{activePart?.title}</Text>
+            <View style={styles.takeMetaRow}>
+              <View style={styles.timerPill}><Ionicons name="time-outline" size={12} color={timeLeft <= 60 ? '#EF4444' : '#1A1E22'} /><Text style={[styles.timerText, timeLeft <= 60 && { color: '#EF4444' }]}>{deadlineMs ? fmtTime(timeLeft) : '--:--'}</Text></View>
+              <View style={styles.saveIndicator}>
+                <View style={[styles.saveDot, { backgroundColor: saveState === 'error' ? '#EF4444' : saveState === 'saving' ? '#F59E0B' : '#10B981' }]} />
+                <Text style={styles.saveText}>
+                  {saveState === 'saving' ? 'Saving…' : saveState === 'saved' ? 'Saved' : saveState === 'error' ? 'Save failed — will retry' : 'Autosave on'}
+                </Text>
+              </View>
             </View>
-          ) : q.type === 'identification' ? (
-            <View style={styles.inputWrap}>
-              <TextInput value={qAnswer || ''} onChangeText={(v) => setAnswers({ ...answers, [mobileIndex]: v })} placeholder="Type your answer" placeholderTextColor="#9AA0A6" style={styles.input} />
-            </View>
-          ) : q.type === 'essay' ? (
-            <View style={styles.inputWrap}>
-              <TextInput value={qAnswer || ''} onChangeText={(v) => setAnswers({ ...answers, [mobileIndex]: v })} placeholder="Write your answer (AI will grade after submit)" placeholderTextColor="#9AA0A6" multiline style={[styles.input, { minHeight: 120, textAlignVertical: 'top' as any }]} />
-              <Text style={styles.essayHint}>Essay is graded by AI after submission — score appears with review.</Text>
-            </View>
-          ) : q.type === 'enumeration' ? (
-            <View style={{ gap: 10 }}>
-              {(q.enumeration_items || []).map((_, ei) => (
-                <View key={ei} style={styles.inputWrap}>
-                  <TextInput value={Array.isArray(qAnswer) ? qAnswer[ei] || '' : ''} onChangeText={(v) => { const arr = Array.isArray(qAnswer) ? [...qAnswer] : Array(q.enumeration_items?.length).fill(''); arr[ei] = v; setAnswers({ ...answers, [mobileIndex]: arr }); }} placeholder={`Answer ${ei + 1}`} placeholderTextColor="#9AA0A6" style={styles.input} />
-                </View>
-              ))}
-            </View>
-          ) : q.type === 'matching' ? (
-            <View style={{ gap: 10 }}>
-              {(q.matching_items || []).map((mi, miIdx) => (
-                <View key={mi.index} style={styles.matchRow}>
-                  <Text style={styles.matchPrompt}>{mi.prompt}</Text>
-                  <View style={styles.matchSelectWrap}>
-                    <TextInput value={Array.isArray(qAnswer) ? qAnswer[miIdx] || '' : ''} onChangeText={(v) => { const arr = Array.isArray(qAnswer) ? [...qAnswer] : Array(q.matching_items?.length).fill(''); arr[miIdx] = v; setAnswers({ ...answers, [mobileIndex]: arr }); }} placeholder="Choose" placeholderTextColor="#9AA0A6" style={styles.matchInput} />
-                  </View>
-                </View>
-              ))}
-            </View>
-          ) : null}
-
-          <View style={styles.qNav}>
-            <TouchableOpacity disabled={mobileIndex === 0} onPress={() => setMobileIndex((i) => Math.max(0, i - 1))} style={[styles.qNavBtn, mobileIndex === 0 && { opacity: 0.4 }]}><Ionicons name="chevron-back" size={16} color="#1A1E22" /><Text style={styles.qNavText}>Prev</Text></TouchableOpacity>
-            <Text style={styles.qNavCount}>{mobileIndex + 1} / {totalQ}</Text>
-            <TouchableOpacity disabled={mobileIndex === totalQ - 1} onPress={() => setMobileIndex((i) => Math.min(totalQ - 1, i + 1))} style={[styles.qNavBtn, mobileIndex === totalQ - 1 && { opacity: 0.4 }]}><Text style={styles.qNavText}>Next</Text><Ionicons name="chevron-forward" size={16} color="#1A1E22" /></TouchableOpacity>
           </View>
-
-          <TouchableOpacity onPress={() => handleSubmitPart()} style={[styles.submitBtn, unanswered === 0 && { backgroundColor: '#1A1E22' }]}>
-            <Text style={styles.submitText}>{unanswered === 0 ? 'Submit part' : `Submit part (${unanswered} unanswered)`}</Text>
+          <TouchableOpacity style={styles.flagBtn} onPress={() => toggleFlag(mobileIndex)}>
+            <Ionicons name={flagged.has(mobileIndex) ? 'flag' : 'flag-outline'} size={18} color={flagged.has(mobileIndex) ? '#D96A3E' : '#9AA0A6'} />
           </TouchableOpacity>
-          {unanswered > 0 && <Text style={styles.unansweredHint}>You have {unanswered} unanswered — you can still submit.</Text>}
+        </View>
+
+        <View style={styles.progressBg}><View style={[styles.progressFg, { width: `${progressPct}%` }]} /></View>
+
+        <ScrollView style={styles.takeScroll} contentContainerStyle={styles.takeContent} showsVerticalScrollIndicator={false}>
+          <View style={styles.qNav}>
+            {activePart?.questions.map((_, i) => (
+              <TouchableOpacity key={i} onPress={() => setMobileIndex(i)} style={[styles.qDot, i === mobileIndex && styles.qDotActive, i < totalQ && answers[i] !== undefined && answers[i] !== null && String(answers[i] ?? '').trim() !== '' && { borderColor: '#3A7D5C' }]}>
+                <Text style={{ color: i === mobileIndex ? '#fff' : '#1A1E22', fontSize: 11, fontWeight: '800' }}>{i + 1}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+          <Text style={styles.qProgressText}>{mobileIndex + 1} / {totalQ} · {answeredCount} answered {unanswered > 0 ? `· ${unanswered} left` : '· all answered'}</Text>
+
+          {q && (
+            <View style={styles.qCard}>
+              <Text style={styles.qText}>{q.text}</Text>
+              <Text style={styles.qPoints}>{q.points} pts · {q.type.replace('_', ' ')}</Text>
+              <QuestionInput
+                question={q}
+                value={answers[mobileIndex]}
+                onChange={(v) => setAnswer(mobileIndex, v)}
+              />
+            </View>
+          )}
+
+          <View style={styles.takeNavRow}>
+            <TouchableOpacity style={[styles.outlineBtn, mobileIndex === 0 && { opacity: 0.4 }]} disabled={mobileIndex === 0} onPress={() => setMobileIndex((i) => Math.max(0, i - 1))}>
+              <Ionicons name="chevron-back" size={16} color="#1A1E22" /><Text style={styles.outlineText}>Previous</Text>
+            </TouchableOpacity>
+            {mobileIndex < totalQ - 1 ? (
+              <TouchableOpacity style={styles.primaryBtn} onPress={() => setMobileIndex((i) => Math.min(totalQ - 1, i + 1))}>
+                <Text style={styles.primaryText}>Next</Text><Ionicons name="chevron-forward" size={16} color="#fff" />
+              </TouchableOpacity>
+            ) : (
+              <TouchableOpacity style={[styles.primaryBtn, submitting && { opacity: 0.7 }]} disabled={submitting} onPress={() => submitPart(false)}>
+                <Text style={styles.primaryText}>{submitting ? 'Submitting…' : 'Submit part'}</Text>
+              </TouchableOpacity>
+            )}
+          </View>
         </ScrollView>
 
-        {/* Unanswered warning - mirrors showUnansweredWarning */}
-        <Modal visible={showUnansweredWarn} transparent animationType="fade" onRequestClose={() => setShowUnansweredWarn(false)}>
+        {/* Start confirmation */}
+        <Modal visible={showStartModal} transparent animationType="fade" onRequestClose={() => setShowStartModal(false)}>
           <View style={styles.modalOverlay}>
             <View style={styles.modalCard}>
-              <View style={styles.warnIcon}><Ionicons name="alert-circle" size={24} color="#F59E0B" /></View>
-              <Text style={styles.modalTitle}>Unanswered questions</Text>
-              <Text style={styles.modalSub}>You have {unanswered} unanswered question{unanswered !== 1 ? 's' : ''}. Submit anyway?</Text>
-              <View style={styles.modalRow}>
-                <TouchableOpacity onPress={() => setShowUnansweredWarn(false)} style={styles.modalCancel}><Text style={styles.modalCancelText}>Review</Text></TouchableOpacity>
-                <TouchableOpacity onPress={() => { setShowUnansweredWarn(false); setPendingSubmit(true); setTimeout(() => handleSubmitPart(true), 200); }} style={[styles.modalConfirm, { backgroundColor: '#D96A3E' }]}><Text style={styles.modalConfirmText}>Submit anyway</Text></TouchableOpacity>
+              <Text style={styles.modalTitle}>Start {pendingIdx != null ? parts[pendingIdx]?.title : 'part'}?</Text>
+              <Text style={styles.modalSub}>
+                The timer runs for the whole exam. Parts lock until the previous one is submitted. Leaving mid-part keeps your autosaved answers.
+              </Text>
+              <View style={{ flexDirection: 'row', gap: 10 }}>
+                <TouchableOpacity style={styles.modalOutline} onPress={() => setShowStartModal(false)}><Text style={styles.outlineText}>Not yet</Text></TouchableOpacity>
+                <TouchableOpacity style={styles.modalPrimary} onPress={confirmStart}><Text style={styles.modalPrimaryText}>Start</Text></TouchableOpacity>
               </View>
             </View>
           </View>
         </Modal>
 
-        {/* Success - mirrors showSuccessModal */}
-        <Modal visible={showSuccess} transparent animationType="fade">
+        {/* Unanswered warning */}
+        <Modal visible={showUnansweredWarn} transparent animationType="fade" onRequestClose={() => setShowUnansweredWarn(false)}>
           <View style={styles.modalOverlay}>
-            <View style={[styles.modalCard, { alignItems: 'center' }]}>
-              <View style={styles.successIcon}><Ionicons name="checkmark-circle" size={48} color="#10B981" /></View>
+            <View style={styles.modalCard}>
+              <View style={[styles.successIcon, { backgroundColor: '#D96A3E' }]}><Ionicons name="alert-circle" size={24} color="#fff" /></View>
+              <Text style={styles.modalTitle}>{unanswered} question{unanswered === 1 ? '' : 's'} unanswered</Text>
+              <Text style={styles.modalSub}>You can still submit, but unanswered questions score 0.</Text>
+              <View style={{ flexDirection: 'row', gap: 10 }}>
+                <TouchableOpacity style={styles.modalOutline} onPress={() => setShowUnansweredWarn(false)}><Text style={styles.outlineText}>Keep answering</Text></TouchableOpacity>
+                <TouchableOpacity style={styles.modalPrimary} onPress={() => { setPendingSubmit(true); submitPart(false); }}><Text style={styles.modalPrimaryText}>Submit anyway</Text></TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
+
+        {/* Success */}
+        <Modal visible={showSuccess} transparent animationType="fade" onRequestClose={() => {}}>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalCard}>
+              <View style={styles.successIcon}><Ionicons name="checkmark" size={26} color="#fff" /></View>
               <Text style={styles.modalTitle}>Part submitted</Text>
-              <Text style={styles.modalSub}>Your answers were saved. {submittedParts.size + 1 < MOCK_PARTS.length ? 'Next part unlocked.' : 'Calculating score...'}</Text>
+              <Text style={styles.modalSub}>
+                {lastPartStatus && ['pending_ai', 'pending_review'].includes(lastPartStatus.status)
+                  ? 'Your essays are being graded — final marks will show in the Exams tab.'
+                  : 'Nice work. Move on to the next part when you’re ready.'}
+              </Text>
+              <TouchableOpacity style={styles.modalPrimary} onPress={() => setShowSuccess(false)}><Text style={styles.modalPrimaryText}>Continue</Text></TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
+
+        {/* Done */}
+        <Modal visible={showDone} transparent animationType="fade" onRequestClose={() => setShowDone(false)}>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalCard}>
+              <View style={styles.successIcon}><Ionicons name="checkmark" size={26} color="#fff" /></View>
+              <Text style={styles.modalTitle}>Exam submitted</Text>
+              {xpAward ? (
+                <View style={styles.xpBox}>
+                  <Text style={styles.xpTotal}>+{xpAward.total_xp} XP</Text>
+                  <Text style={styles.xpSub}>
+                    Completion {xpAward.completion_xp} · Accuracy {xpAward.accuracy_xp}
+                    {xpAward.on_time_xp ? ` · On time ${xpAward.on_time_xp}` : ''}
+                    {xpAward.accuracy_pending ? ' · essays still grading' : ''}
+                  </Text>
+                </View>
+              ) : (
+                <Text style={styles.modalSub}>All parts submitted. Your results will appear in the Exams tab.</Text>
+              )}
+              <TouchableOpacity style={styles.modalPrimary} onPress={() => router.navigate('/(tabs)/exams')}><Text style={styles.modalPrimaryText}>Back to Exams</Text></TouchableOpacity>
             </View>
           </View>
         </Modal>
@@ -378,87 +686,236 @@ export default function ExamTakeScreen() {
   );
 }
 
+// ---------------------------------------------------------------- helpers
+function Header({ title, onBack }: { title: string; onBack: () => void }) {
+  return (
+    <View style={styles.header}>
+      <TouchableOpacity onPress={onBack} style={styles.backBtn}><Ionicons name="chevron-back" size={20} color="#1A1E22" /></TouchableOpacity>
+      <Text style={styles.headerTitle} numberOfLines={1}>{title}</Text>
+      <View style={{ width: 36 }} />
+    </View>
+  );
+}
+
+function QuestionInput({ question, value, onChange }: { question: Question; value: any; onChange: (v: any) => void }) {
+  if (question.type === 'multiple_choice' || question.type === 'true_false') {
+    return (
+      <View style={{ gap: 8, marginTop: 12 }}>
+        {(question.options ?? []).map((opt, i) => {
+          const selected = value === i;
+          return (
+            <TouchableOpacity key={i} style={[styles.opt, selected && styles.optSelected]} onPress={() => onChange(i)}>
+              <View style={[styles.radio, selected && styles.radioSel]}>{selected && <View style={styles.radioDot} />}</View>
+              <Text style={[styles.optText, selected && { fontWeight: '700' }]}>{opt.text}</Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
+    );
+  }
+  if (question.type === 'identification') {
+    return (
+      <View style={[styles.inputWrap, { marginTop: 12 }]}>
+        <TextInput value={typeof value === 'string' ? value : ''} onChangeText={(v) => onChange(v)} placeholder="Type your answer" placeholderTextColor="#9AA0A6" style={styles.input} />
+      </View>
+    );
+  }
+  if (question.type === 'essay') {
+    return (
+      <View style={[styles.inputWrap, { marginTop: 12 }]}>
+        <TextInput value={typeof value === 'string' ? value : ''} onChangeText={(v) => onChange(v)} placeholder="Write your answer" placeholderTextColor="#9AA0A6" multiline style={[styles.input, { minHeight: 120, textAlignVertical: 'top' as any }]} />
+      </View>
+    );
+  }
+  if (question.type === 'enumeration') {
+    const count = question.enumeration_items?.length ?? 3;
+    const arr: string[] = Array.isArray(value) ? value : Array.from({ length: count }, () => '');
+    return (
+      <View style={{ gap: 8, marginTop: 12 }}>
+        {Array.from({ length: count }).map((_, i) => (
+          <View key={i} style={styles.inputWrap}>
+            <Text style={{ fontSize: 12, fontWeight: '800', color: '#6B7280', marginHorizontal: 12 }}>{i + 1}.</Text>
+            <TextInput value={arr[i] ?? ''} onChangeText={(v) => { const next = [...arr]; next[i] = v; onChange(next); }} placeholder={`Item ${i + 1}`} placeholderTextColor="#9AA0A6" style={styles.input} />
+          </View>
+        ))}
+      </View>
+    );
+  }
+  if (question.type === 'matching') {
+    const map: Record<number, string> = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    return (
+      <View style={{ gap: 12, marginTop: 12 }}>
+        {(question.matching_items ?? []).map((item) => (
+          <View key={item.index}>
+            <Text style={styles.matchPrompt}>{item.prompt}</Text>
+            <View style={{ gap: 6, marginTop: 6 }}>
+              {(question.matching_options ?? []).map((opt) => {
+                const selected = map[item.index] === opt.value;
+                return (
+                  <TouchableOpacity key={opt.value} style={[styles.opt, { paddingVertical: 10 }, selected && styles.optSelected]} onPress={() => onChange({ ...map, [item.index]: opt.value })}>
+                    <View style={[styles.radio, selected && styles.radioSel]}>{selected && <View style={styles.radioDot} />}</View>
+                    <Text style={[styles.optText, selected && { fontWeight: '700' }]}>{opt.text} ({opt.value})</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          </View>
+        ))}
+      </View>
+    );
+  }
+  return null;
+}
+
+function PartReview({ part, index }: { part: Part; index: number }) {
+  const answers = (part.answers ?? part.user_answers ?? {}) as Record<number, any>;
+  const hasReview =
+    part.questions.some((q) => q.feedback) ||
+    Object.keys(answers).length > 0 ||
+    part.questions.some((q) => q.options?.some((o) => o.is_correct) || q.correct_answer);
+  const gradingPending = part.submissionStatus === 'pending_ai' || part.submissionStatus === 'pending_review';
+
+  return (
+    <View style={styles.reviewPart}>
+      <View style={styles.reviewPartHead}>
+        <View style={[styles.partNum, partSubmitted(part) ? styles.partNumDone : {}]}><Text style={[styles.partNumText, !partSubmitted(part) && { color: '#D96A3E' }]}>{index}</Text></View>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.partTitle}>{part.title}</Text>
+          <Text style={styles.partMeta}>
+            {part.score != null ? `Score ${part.score} / ${part.points}` : `${part.points} pts`}
+            {gradingPending ? ' · essays still grading' : ''}
+          </Text>
+        </View>
+        <View style={partSubmitted(part) ? styles.doneBadge : styles.lockBadge}>
+          <Text style={partSubmitted(part) ? styles.doneBadgeText : styles.lockBadgeText}>{partSubmitted(part) ? 'Submitted' : 'Not submitted'}</Text>
+        </View>
+      </View>
+      {!hasReview && partSubmitted(part) && part.score == null && (
+        <Text style={{ fontSize: 12, color: '#6B7280', marginTop: 8, lineHeight: 16 }}>
+          Per-question detail isn&apos;t available yet (grading may still be in progress).
+        </Text>
+      )}
+      {part.questions.map((q, i) => {
+        const userAnswer = answers[i];
+        const correctOpt = q.options?.find((o) => o.is_correct)?.text;
+        return (
+          <View key={q.id ?? i} style={styles.reviewQ}>
+            <Text style={styles.reviewQText}>{i + 1}. {q.text}</Text>
+            {userAnswer !== undefined && userAnswer !== null && String(userAnswer ?? '').trim() !== '' && (
+              <Text style={styles.reviewLine}><Text style={styles.reviewLabel}>Your answer: </Text>{formatAnswer(q, userAnswer)}</Text>
+            )}
+            {correctOpt || q.correct_answer ? (
+              <Text style={styles.reviewLine}><Text style={styles.reviewLabel}>Correct: </Text>{correctOpt ?? q.correct_answer}</Text>
+            ) : null}
+            {q.feedback ? <Text style={styles.reviewFeedback}>{q.feedback}</Text> : null}
+          </View>
+        );
+      })}
+    </View>
+  );
+}
+
+function formatAnswer(q: Question, v: any): string {
+  if (typeof v === 'number' && q.options) return q.options[v]?.text ?? String(v);
+  if (Array.isArray(v)) return v.filter(Boolean).join(', ');
+  if (v && typeof v === 'object') {
+    return Object.entries(v).map(([k, val]) => `${q.matching_items?.[Number(k)]?.prompt ?? k} → ${String(val)}`).join(', ');
+  }
+  return String(v);
+}
+
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: '#FDFBF6' },
   webWrap: { flex: 1, width: '100%', maxWidth: 480, alignSelf: 'center', backgroundColor: '#FDFBF6' },
-  header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 14, paddingVertical: 12, backgroundColor: '#FDFBF6', borderBottomWidth: 1, borderBottomColor: '#EAE5DE' },
+  headerPlaceholder: { height: 40 },
+  header: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 14, paddingVertical: 12, backgroundColor: '#FDFBF6' },
+  headerTitle: { flex: 1, fontSize: 16, fontWeight: '800', color: '#1A1E22' },
   backBtn: { width: 36, height: 36, borderRadius: 10, borderWidth: 1, borderColor: '#EAE5DE', backgroundColor: '#fff', alignItems: 'center', justifyContent: 'center' },
-  headerTitle: { fontSize: 13, fontWeight: '800', color: '#1A1E22', flex: 1, textAlign: 'center', marginHorizontal: 8 },
   content: { padding: 14, gap: 12, paddingBottom: 24 },
-  examHero: { backgroundColor: '#fff', borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 16, padding: 16, gap: 8, alignItems: 'center' },
-  heroTitle: { fontSize: 16, fontWeight: '900', color: '#1A1E22', textAlign: 'center' },
-  heroSub: { fontSize: 11, color: '#6B7280' },
-  heroProgress: { width: '100%', height: 6, backgroundColor: '#F0F0F0', borderRadius: 3, marginTop: 4 },
-  heroProgressFg: { height: 6, backgroundColor: '#1A1E22', borderRadius: 3 },
-  heroProgressText: { fontSize: 11, color: '#6B7280', fontWeight: '600' },
-  partCard: { flexDirection: 'row', gap: 12, backgroundColor: '#fff', borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 12, padding: 14, alignItems: 'center' },
-  partIcon: { width: 36, height: 36, borderRadius: 18, alignItems: 'center', justifyContent: 'center' },
-  partTitle: { fontSize: 13, fontWeight: '800', color: '#1A1E22' },
+  examMeta: { flexDirection: 'row', gap: 8, flexWrap: 'wrap' },
+  metaChip: { flexDirection: 'row', alignItems: 'center', gap: 5, borderWidth: 1, borderColor: '#EAE5DE', backgroundColor: '#fff', borderRadius: 20, paddingHorizontal: 10, paddingVertical: 6 },
+  metaChipText: { fontSize: 11, color: '#6B7280', fontWeight: '600' },
+  sectionTitle: { fontSize: 13, letterSpacing: 1, fontWeight: '800', color: '#6B7280', textTransform: 'uppercase', marginTop: 6 },
+  partCard: { flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: '#fff', borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 14, padding: 14 },
+  partNum: { width: 34, height: 34, borderRadius: 17, backgroundColor: '#EAE5DE', alignItems: 'center', justifyContent: 'center' },
+  partNumDone: { backgroundColor: '#3A7D5C' },
+  partNumText: { fontSize: 14, fontWeight: '900', color: '#6B7280' },
+  partTitle: { fontSize: 14, fontWeight: '800', color: '#1A1E22' },
   partMeta: { fontSize: 11, color: '#6B7280', marginTop: 2 },
-  partInstr: { fontSize: 11, color: '#9AA0A6', marginTop: 4, fontStyle: 'italic' },
-  doneBadge: { backgroundColor: '#ECFDF5', borderWidth: 1, borderColor: '#A7F3D0', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8 },
-  doneBadgeText: { fontSize: 10, fontWeight: '800', color: '#065F46' },
-  hintCard: { flexDirection: 'row', gap: 8, backgroundColor: '#FFF6F0', borderWidth: 1, borderColor: '#F0C4B0', borderRadius: 10, padding: 10, alignItems: 'center' },
-  hintText: { flex: 1, fontSize: 11, color: '#9A4600', lineHeight: 14 },
-  doneCard: { backgroundColor: '#fff', borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 16, padding: 24, alignItems: 'center', gap: 10 },
-  doneTitle: { fontSize: 16, fontWeight: '900', color: '#1A1E22' },
-  doneSub: { fontSize: 12, color: '#6B7280', textAlign: 'center' },
-  primaryBtn: { backgroundColor: '#15181E', borderRadius: 10, paddingVertical: 12, paddingHorizontal: 20, alignItems: 'center' },
-  primaryText: { color: '#fff', fontWeight: '800', fontSize: 13 },
-  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', alignItems: 'center', justifyContent: 'center', padding: 20 },
-  modalCard: { width: '100%', maxWidth: 360, backgroundColor: '#fff', borderRadius: 16, padding: 20, gap: 12 },
-  modalIcon: { width: 48, height: 48, borderRadius: 24, backgroundColor: '#FFF0EB', alignItems: 'center', justifyContent: 'center', alignSelf: 'center' },
-  warnIcon: { width: 48, height: 48, borderRadius: 24, backgroundColor: '#FFFBEB', alignItems: 'center', justifyContent: 'center', alignSelf: 'center' },
-  successIcon: { alignItems: 'center', justifyContent: 'center' },
-  modalTitle: { fontSize: 16, fontWeight: '900', color: '#1A1E22', textAlign: 'center' },
-  modalSub: { fontSize: 12, color: '#6B7280', textAlign: 'center', lineHeight: 16 },
-  modalHint: { fontSize: 11, color: '#9AA0A6', textAlign: 'center' },
-  modalRow: { flexDirection: 'row', gap: 10, marginTop: 4 },
-  modalCancel: { flex: 1, borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 10, paddingVertical: 12, alignItems: 'center', backgroundColor: '#fff' },
-  modalCancelText: { fontWeight: '700', color: '#1A1E22', fontSize: 13 },
-  modalConfirm: { flex: 1, backgroundColor: '#1A1E22', borderRadius: 10, paddingVertical: 12, alignItems: 'center' },
-  modalConfirmText: { color: '#fff', fontWeight: '800', fontSize: 13 },
-  xpRow: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 4 },
-  xpLabel: { fontSize: 12, color: '#6B7280' },
-  xpVal: { fontSize: 12, fontWeight: '800', color: '#1A1E22' },
-  takeHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 14, paddingVertical: 10, backgroundColor: '#fff', borderBottomWidth: 1, borderBottomColor: '#EAE5DE', gap: 8 },
-  timerPill: { flexDirection: 'row', alignItems: 'center', gap: 6, borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 20, paddingHorizontal: 10, paddingVertical: 6, backgroundColor: '#FFFEFC' },
-  timerText: { fontSize: 13, fontWeight: '900', color: '#1A1E22', fontVariant: ['tabular-nums'] as any },
-  savePill: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 8, paddingVertical: 6 },
-  saveDot: { width: 8, height: 8, borderRadius: 4 },
-  saveText: { fontSize: 11, fontWeight: '700', color: '#6B7280' },
-  progressRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: '#FFFEFC', borderBottomWidth: 1, borderBottomColor: '#EAE5DE' },
-  progressBg: { flex: 1, height: 6, backgroundColor: '#F0F0F0', borderRadius: 3 },
-  progressFg: { height: 6, backgroundColor: '#1A1E22', borderRadius: 3 },
-  progressText: { fontSize: 11, fontWeight: '700', color: '#1A1E22' },
-  flagBtn: { flexDirection: 'row', alignItems: 'center', gap: 4, borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 8, paddingHorizontal: 8, paddingVertical: 6, backgroundColor: '#fff' },
-  flagText: { fontSize: 11, fontWeight: '700', color: '#6B7280' },
-  navRow: { flexDirection: 'row', gap: 8, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: '#FDFBF6' },
-  navDot: { width: 32, height: 32, borderRadius: 16, borderWidth: 1, borderColor: '#EAE5DE', backgroundColor: '#fff', alignItems: 'center', justifyContent: 'center' },
-  navActive: { backgroundColor: '#1A1E22', borderColor: '#1A1E22' },
-  navNum: { fontSize: 11, fontWeight: '800', color: '#1A1E22' },
-  qContent: { padding: 14, gap: 14, paddingBottom: 24 },
-  qType: { fontSize: 10, letterSpacing: 1, fontWeight: '800', color: '#9AA0A6', textTransform: 'uppercase' },
-  qText: { fontSize: 15, fontWeight: '700', color: '#1A1E22', lineHeight: 20 },
-  opt: { flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: '#fff', borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 12, padding: 14 },
-  optSelected: { borderColor: '#1A1E22', backgroundColor: '#F9F7F4' },
-  radio: { width: 20, height: 20, borderRadius: 10, borderWidth: 1.5, borderColor: '#CFCFCF', alignItems: 'center', justifyContent: 'center' },
+  openBadge: { borderWidth: 1, borderColor: '#F0C4B0', backgroundColor: '#FFF0EB', paddingHorizontal: 10, paddingVertical: 5, borderRadius: 10 },
+  openBadgeText: { fontSize: 11, fontWeight: '800', color: '#D96A3E' },
+  doneBadge: { borderWidth: 1, borderColor: '#C8DDC8', backgroundColor: '#EAF4E8', paddingHorizontal: 10, paddingVertical: 5, borderRadius: 10 },
+  doneBadgeText: { fontSize: 11, fontWeight: '800', color: '#3A7D5C' },
+  lockBadge: { borderWidth: 1, borderColor: '#EAE5DE', backgroundColor: '#F5F5F5', paddingHorizontal: 10, paddingVertical: 5, borderRadius: 10 },
+  lockBadgeText: { fontSize: 11, fontWeight: '800', color: '#8A8A8A' },
+  doneCard: { flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: '#1A1E22', borderRadius: 14, padding: 16, marginTop: 6 },
+  doneCardTitle: { color: '#fff', fontSize: 14, fontWeight: '800' },
+  doneCardSub: { color: '#B8B8B8', fontSize: 11, marginTop: 2 },
+  emptyBox: { alignItems: 'center', gap: 12, backgroundColor: '#fff', borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 14, padding: 20 },
+  emptyText: { fontSize: 13, color: '#6B7280', textAlign: 'center', lineHeight: 18 },
+  webLinkBtn: { backgroundColor: '#D96A3E', borderRadius: 10, paddingHorizontal: 18, paddingVertical: 12 },
+  webLinkText: { color: '#fff', fontSize: 13, fontWeight: '800' },
+  errorWrap: { alignItems: 'center', gap: 10, padding: 24 },
+  errorIcon: { width: 72, height: 72, borderRadius: 36, backgroundColor: '#F5F5F5', alignItems: 'center', justifyContent: 'center' },
+  errorTitle: { fontSize: 16, fontWeight: '900', color: '#1A1E22' },
+  errorText: { fontSize: 12, color: '#6B7280', textAlign: 'center', lineHeight: 16 },
+  retryBtn: { backgroundColor: '#1A1E22', borderRadius: 10, paddingHorizontal: 22, paddingVertical: 12 },
+  retryText: { color: '#fff', fontSize: 13, fontWeight: '800' },
+  // review
+  reviewBanner: { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: '#EAF4E8', borderWidth: 1, borderColor: '#C8DDC8', borderRadius: 12, padding: 12 },
+  reviewBannerText: { flex: 1, fontSize: 12, fontWeight: '700', color: '#3A7D5C' },
+  reviewPart: { backgroundColor: '#fff', borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 14, padding: 14, gap: 10 },
+  reviewPartHead: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  reviewQ: { borderTopWidth: 1, borderTopColor: '#F0F0F0', paddingTop: 10, gap: 4 },
+  reviewQText: { fontSize: 13, fontWeight: '700', color: '#1A1E22', lineHeight: 17 },
+  reviewLine: { fontSize: 12, color: '#1A1E22', lineHeight: 16 },
+  reviewLabel: { fontWeight: '700', color: '#6B7280' },
+  reviewFeedback: { fontSize: 12, color: '#3A7D5C', lineHeight: 16, fontStyle: 'italic' },
+  // taking
+  takeHeader: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 14, paddingVertical: 12, backgroundColor: '#FDFBF6' },
+  takeTitle: { fontSize: 14, fontWeight: '800', color: '#1A1E22' },
+  takeMetaRow: { flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 3 },
+  timerPill: { flexDirection: 'row', alignItems: 'center', gap: 4, borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 10, paddingHorizontal: 8, paddingVertical: 3, backgroundColor: '#fff' },
+  timerText: { fontSize: 11, fontWeight: '800', color: '#1A1E22' },
+  saveIndicator: { flexDirection: 'row', alignItems: 'center', gap: 5 },
+  saveDot: { width: 7, height: 7, borderRadius: 4 },
+  saveText: { fontSize: 10, color: '#6B7280', fontWeight: '600' },
+  flagBtn: { width: 36, height: 36, borderRadius: 10, borderWidth: 1, borderColor: '#EAE5DE', backgroundColor: '#fff', alignItems: 'center', justifyContent: 'center' },
+  progressBg: { height: 4, backgroundColor: '#F0F0F0' },
+  progressFg: { height: 4, backgroundColor: '#D96A3E' },
+  takeScroll: { flex: 1, backgroundColor: '#FDFBF6' },
+  takeContent: { padding: 14, gap: 10, paddingBottom: 24 },
+  qNav: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
+  qDot: { width: 30, height: 30, borderRadius: 15, borderWidth: 1, borderColor: '#EAE5DE', backgroundColor: '#fff', alignItems: 'center', justifyContent: 'center' },
+  qDotActive: { backgroundColor: '#1A1E22', borderColor: '#1A1E22' },
+  qProgressText: { fontSize: 11, color: '#6B7280', fontWeight: '600' },
+  qCard: { backgroundColor: '#fff', borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 14, padding: 14 },
+  qText: { fontSize: 15, fontWeight: '800', color: '#1A1E22', lineHeight: 21 },
+  qPoints: { fontSize: 11, color: '#6B7280', marginTop: 4, textTransform: 'capitalize' },
+  opt: { flexDirection: 'row', alignItems: 'center', gap: 10, borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 12, padding: 12, backgroundColor: '#FFFEFC' },
+  optSelected: { borderColor: '#1A1E22', backgroundColor: '#F5F3EF' },
+  radio: { width: 18, height: 18, borderRadius: 9, borderWidth: 1.5, borderColor: '#CFCFCF', alignItems: 'center', justifyContent: 'center' },
   radioSel: { borderColor: '#1A1E22' },
-  radioDot: { width: 10, height: 10, borderRadius: 5, backgroundColor: '#1A1E22' },
-  optText: { flex: 1, fontSize: 13, fontWeight: '600', color: '#1A1E22' },
-  kbHint: { fontSize: 10, color: '#9AA0A6', textAlign: 'center' },
-  inputWrap: { borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 12, backgroundColor: '#fff', paddingHorizontal: 12 },
-  input: { paddingVertical: 12, fontSize: 14, color: '#1A1E22' },
-  essayHint: { fontSize: 10, color: '#9AA0A6', marginTop: 6 },
-  matchRow: { flexDirection: 'row', gap: 10, alignItems: 'center', backgroundColor: '#fff', borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 12, padding: 12 },
-  matchPrompt: { flex: 1, fontSize: 12, fontWeight: '600', color: '#1A1E22' },
-  matchSelectWrap: { flex: 1, borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 8, paddingHorizontal: 8, backgroundColor: '#FFFEFC' },
-  matchInput: { paddingVertical: 8, fontSize: 12, color: '#1A1E22' },
-  qNav: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 8 },
-  qNavBtn: { flexDirection: 'row', alignItems: 'center', gap: 6, borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 10, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: '#fff' },
-  qNavText: { fontSize: 12, fontWeight: '700', color: '#1A1E22' },
-  qNavCount: { fontSize: 12, fontWeight: '700', color: '#6B7280' },
-  submitBtn: { backgroundColor: '#6B7280', borderRadius: 10, paddingVertical: 14, alignItems: 'center', marginTop: 8 },
-  submitText: { color: '#fff', fontWeight: '800', fontSize: 13 },
-  unansweredHint: { fontSize: 11, color: '#9AA0A6', textAlign: 'center' },
+  radioDot: { width: 9, height: 9, borderRadius: 5, backgroundColor: '#1A1E22' },
+  optText: { flex: 1, fontSize: 13, color: '#1A1E22' },
+  inputWrap: { flexDirection: 'row', alignItems: 'center', borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 10, paddingHorizontal: 4, backgroundColor: '#FFFEFC' },
+  input: { flex: 1, paddingVertical: 12, paddingHorizontal: 8, fontSize: 14, color: '#1A1E22' },
+  matchPrompt: { fontSize: 13, fontWeight: '700', color: '#1A1E22' },
+  takeNavRow: { flexDirection: 'row', gap: 10, marginTop: 6 },
+  outlineBtn: { flexDirection: 'row', alignItems: 'center', gap: 6, borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 10, paddingHorizontal: 16, paddingVertical: 12, backgroundColor: '#fff' },
+  outlineText: { fontWeight: '700', fontSize: 13, color: '#1A1E22' },
+  primaryBtn: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, backgroundColor: '#D96A3E', borderRadius: 10, paddingVertical: 12 },
+  primaryText: { color: '#fff', fontWeight: '800', fontSize: 13 },
+  // modals
+  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', alignItems: 'center', justifyContent: 'center', padding: 20 },
+  modalCard: { width: '100%', maxWidth: 480, backgroundColor: '#fff', borderRadius: 16, padding: 20, gap: 12, alignItems: 'center' },
+  modalTitle: { fontSize: 16, fontWeight: '900', color: '#1A1E22', textAlign: 'center' },
+  modalSub: { fontSize: 12, color: '#6B7280', textAlign: 'center', lineHeight: 17 },
+  modalPrimary: { backgroundColor: '#1A1E22', borderRadius: 10, paddingVertical: 12, paddingHorizontal: 24, alignItems: 'center' },
+  modalPrimaryText: { color: '#fff', fontWeight: '800', fontSize: 13 },
+  modalOutline: { borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 10, paddingVertical: 12, paddingHorizontal: 24, backgroundColor: '#fff' },
+  successIcon: { width: 56, height: 56, borderRadius: 28, backgroundColor: '#3A7D5C', alignItems: 'center', justifyContent: 'center' },
+  xpBox: { alignItems: 'center', backgroundColor: '#FFFEFC', borderWidth: 1, borderColor: '#F0C4B0', borderRadius: 12, padding: 12, gap: 4 },
+  xpTotal: { fontSize: 22, fontWeight: '900', color: '#D96A3E' },
+  xpSub: { fontSize: 11, color: '#6B7280' },
 });

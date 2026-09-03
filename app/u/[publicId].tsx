@@ -1,12 +1,12 @@
-// @ts-nocheck
 import { Ionicons } from '@expo/vector-icons';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { useEffect, useState } from 'react';
-import { ScrollView, StyleSheet, Text, TouchableOpacity, View, Image } from 'react-native';
+import { useCallback, useEffect, useState } from 'react';
+import { Alert, ScrollView, StyleSheet, Text, TouchableOpacity, View, Image } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { api } from '@/lib/api';
+import { api, errorMessage } from '@/lib/api';
 import { useAuth } from '@/context/AuthContext';
 import { PageSkeleton } from '@/components/PageSkeleton';
+import { initials } from '@/lib/format';
 
 export default function PublicProfileScreen() {
   const { publicId } = useLocalSearchParams<{ publicId: string }>();
@@ -14,38 +14,54 @@ export default function PublicProfileScreen() {
   const { user: me } = useAuth();
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [followLoading, setFollowLoading] = useState(false);
   const [activeTab, setActiveTab] = useState<'activity' | 'achievements' | 'courses'>('activity');
 
-  useEffect(() => {
+  const load = useCallback(async () => {
     if (!publicId) return;
     setLoading(true);
-    api.get(`/u/${publicId}`)
-      .then(r => setData((r.data ?? r)))
-      .catch(() => api.get(`/api/u/${publicId}`).then(r => setData((r.data ?? r))).catch(() => setData(null)))
-      .finally(() => setLoading(false));
+    setError(null);
+    try {
+      const r: any = await api.get(`/mobile/u/${publicId}`);
+      setData(r.data ?? r);
+    } catch (e) {
+      setData(null);
+      setError(errorMessage(e));
+    } finally {
+      setLoading(false);
+    }
   }, [publicId]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
 
   const toggleFollow = async () => {
     if (!data?.profileUser) return;
     setFollowLoading(true);
     try {
       if (data.isFollowing) {
-        await api.delete(`/u/${publicId}/follow`);
+        await api.delete(`/mobile/u/${publicId}/follow`);
       } else {
-        await api.post(`/u/${publicId}/follow`);
+        await api.post(`/mobile/u/${publicId}/follow`);
       }
       setData((prev: any) => ({ ...prev, isFollowing: !prev.isFollowing, stats: { ...prev.stats, followersCount: prev.isFollowing ? prev.stats.followersCount - 1 : prev.stats.followersCount + 1 } }));
-    } catch {} finally { setFollowLoading(false); }
+    } catch (e) {
+      Alert.alert('Could not update follow', errorMessage(e));
+    } finally {
+      setFollowLoading(false);
+    }
   };
 
   const sendKudo = async (type: string) => {
     try {
-      await api.post(`/u/${publicId}/kudos`, { type });
-      // refresh
-      const r = await api.get(`/u/${publicId}`);
-      setData((r.data ?? r));
-    } catch {}
+      await api.post(`/mobile/u/${publicId}/kudos`, { type });
+      const r: any = await api.get(`/mobile/u/${publicId}`);
+      setData(r.data ?? r);
+    } catch (e) {
+      Alert.alert('Could not send kudos', errorMessage(e));
+    }
   };
 
   if (loading) {
@@ -61,7 +77,10 @@ export default function PublicProfileScreen() {
       <SafeAreaView style={styles.safe} edges={['top']}>
         <View style={styles.webWrap}>
           <View style={styles.header}><TouchableOpacity onPress={() => router.back()} style={styles.backBtn}><Ionicons name="chevron-back" size={20} color="#1A1E22" /></TouchableOpacity><Text style={styles.headerTitle}>Profile</Text><View style={{ width: 36 }} /></View>
-          <View style={{ alignItems: 'center', padding: 32 }}><Text>Profile not found or private.</Text></View>
+          <View style={{ alignItems: 'center', gap: 8, padding: 32 }}>
+            <Text style={{ textAlign: 'center', lineHeight: 18 }}>{error ? `Couldn't load this profile.\n${error}` : 'Profile not found or private.'}</Text>
+            {!!error && <TouchableOpacity style={[styles.kudoBtn, { backgroundColor: '#1A1E22', borderRadius: 10, paddingHorizontal: 20, paddingVertical: 10 }]} onPress={load}><Text style={{ color: '#fff', fontWeight: '700', fontSize: 12 }}>Try again</Text></TouchableOpacity>}
+          </View>
         </View>
       </SafeAreaView>
     );
@@ -84,7 +103,13 @@ export default function PublicProfileScreen() {
           <View style={styles.coverWrap}>
             {p.cover_photo ? <Image source={{ uri: p.cover_photo }} style={styles.cover} /> : <View style={styles.coverPlaceholder} />}
             <View style={styles.avatarRing}>
-              <Image source={{ uri: p.avatar ?? `https://i.pravatar.cc/200?img=15` }} style={styles.avatarLarge} />
+              {p.avatar ? (
+                <Image source={{ uri: p.avatar }} style={styles.avatarLarge} />
+              ) : (
+                <View style={[styles.avatarLarge, { alignItems: 'center', justifyContent: 'center', backgroundColor: '#D96A3E' }]}>
+                  <Text style={{ color: '#fff', fontSize: 26, fontWeight: '900' }}>{initials(p.name)}</Text>
+                </View>
+              )}
             </View>
           </View>
           <View style={styles.nameRow}>

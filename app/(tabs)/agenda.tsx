@@ -1,26 +1,40 @@
-// @ts-nocheck
 import { Ionicons } from '@expo/vector-icons';
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Platform, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { api } from '@/lib/api';
+import { api, errorMessage } from '@/lib/api';
 import { useAuth } from '@/context/AuthContext';
 import { PageSkeleton } from '@/components/PageSkeleton';
+import { localDateKey, parseDate } from '@/lib/format';
 
 export default function AgendaScreen() {
   const { token } = useAuth();
   const [data, setData] = useState<any>(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [selectedDate, setSelectedDate] = useState<string | null>(null);
 
-  useEffect(() => {
+  const load = useCallback(async () => {
     if (!token) return;
     setLoading(true);
-    api.get('/calendar').then((r: any) => setData((r.data ?? r) as any)).catch(() => setData({ events: [] })).finally(() => setLoading(false));
+    setError(null);
+    try {
+      const r: any = await api.get('/mobile/calendar');
+      setData(r.data ?? r);
+    } catch (e) {
+      setError(errorMessage(e));
+      setData(null);
+    } finally {
+      setLoading(false);
+    }
   }, [token]);
 
-  const events: any[] = data?.events ?? [];
-  const todayKey: string = data?.todayKey ?? new Date().toISOString().slice(0, 10);
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const events: any[] = useMemo(() => data?.events ?? [], [data]);
+  const todayKey: string = data?.todayKey ?? localDateKey(new Date());
 
   const grouped = useMemo(() => {
     const map = new Map<string, any[]>();
@@ -33,13 +47,12 @@ export default function AgendaScreen() {
 
   const dates = useMemo(() => {
     const out: { key: string; label: string; dayNum: string }[] = [];
-    const base = selectedDate ? new Date(selectedDate) : new Date(todayKey);
-    // Show 7 days window around selected
+    const base = parseDate(selectedDate ?? todayKey) ?? new Date();
+    // Show 7-day window around the selected day (local-time date keys).
     for (let i = -2; i <= 4; i++) {
       const d = new Date(base);
       d.setDate(base.getDate() + i);
-      const key = d.toISOString().slice(0, 10);
-      out.push({ key, label: d.toLocaleDateString('en-US', { weekday: 'short' }), dayNum: String(d.getDate()) });
+      out.push({ key: localDateKey(d), label: d.toLocaleDateString('en-US', { weekday: 'short' }), dayNum: String(d.getDate()) });
     }
     return out;
   }, [selectedDate, todayKey]);
@@ -49,17 +62,24 @@ export default function AgendaScreen() {
 
   useEffect(() => {
     if (!selectedDate && todayKey) setSelectedDate(todayKey);
-  }, [todayKey]);
+  }, [selectedDate, todayKey]);
 
   return (
     <SafeAreaView style={styles.safe} edges={['top']}>
       <View style={styles.webWrap}>
         <View style={styles.header}>
           <Text style={styles.headerTitle}>Agenda</Text>
-          <TouchableOpacity style={styles.calBtn}><Ionicons name="calendar-outline" size={20} color="#1A1E22" /></TouchableOpacity>
         </View>
         <ScrollView style={styles.container} contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
-          {loading ? <PageSkeleton count={3} /> : (
+          {loading ? (
+            <PageSkeleton count={3} />
+          ) : error ? (
+            <View style={styles.empty}>
+              <View style={styles.emptyIcon}><Ionicons name="cloud-offline-outline" size={32} color="#8A8A8A" /></View>
+              <Text style={styles.emptyText}>{error}</Text>
+              <TouchableOpacity style={styles.retryBtn} onPress={load}><Text style={styles.retryText}>Try again</Text></TouchableOpacity>
+            </View>
+          ) : (
             <>
               <View style={styles.weekCard}>
                 {dates.map((d) => (
@@ -70,7 +90,7 @@ export default function AgendaScreen() {
                   </TouchableOpacity>
                 ))}
               </View>
-              <Text style={styles.dateTitle}>{new Date(activeKey).toLocaleDateString('en-US', { weekday: 'long', day: 'numeric', month: 'long' })}</Text>
+              <Text style={styles.dateTitle}>{(parseDate(activeKey) ?? new Date()).toLocaleDateString('en-US', { weekday: 'long', day: 'numeric', month: 'long' })}</Text>
               {activeEvents.length === 0 ? (
                 <View style={styles.empty}><View style={styles.emptyIcon}><Ionicons name="calendar-outline" size={32} color="#8A8A8A" /></View><Text style={styles.emptyText}>No events for this day</Text></View>
               ) : (
@@ -90,7 +110,7 @@ export default function AgendaScreen() {
                   ))}
                 </View>
               )}
-              <View style={styles.empty}><Text style={styles.emptyText}>{events.length} total events in 14-month window</Text></View>
+              <View style={styles.empty}><Text style={styles.emptyText}>{events.length} event{events.length === 1 ? '' : 's'} total</Text></View>
             </>
           )}
         </ScrollView>
@@ -103,7 +123,6 @@ const styles = StyleSheet.create({
   webWrap: { flex: 1, width: '100%', maxWidth: 480, alignSelf: 'center' },
   header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 14, paddingVertical: 12, backgroundColor: '#FDFBF6' },
   headerTitle: { fontSize: 22, fontWeight: '900', color: '#1A1E22' },
-  calBtn: { width: 38, height: 38, borderRadius: 10, borderWidth: 1, borderColor: '#EAE5DE', backgroundColor: '#fff', alignItems: 'center', justifyContent: 'center' },
   container: { flex: 1, backgroundColor: '#FDFBF6' },
   content: { paddingHorizontal: 14, paddingBottom: Platform.OS === 'web' ? 90 : 16 },
   weekCard: { flexDirection: 'row', backgroundColor: '#fff', borderWidth: 1, borderColor: '#EAE5DE', borderRadius: 14, padding: 6, justifyContent: 'space-between' },
@@ -131,5 +150,7 @@ const styles = StyleSheet.create({
   startText: { fontSize: 11, color: '#3A7D5C', fontWeight: '700' },
   empty: { alignItems: 'center', marginTop: 24, gap: 8 },
   emptyIcon: { width: 56, height: 56, borderRadius: 28, backgroundColor: '#F0F0F0', alignItems: 'center', justifyContent: 'center' },
+  retryBtn: { backgroundColor: '#1A1E22', borderRadius: 10, paddingHorizontal: 20, paddingVertical: 10, marginTop: 4 },
+  retryText: { color: '#fff', fontSize: 12, fontWeight: '700' },
   emptyText: { fontSize: 12, color: '#8A8A8A' },
 });

@@ -1,11 +1,12 @@
 import { Ionicons } from '@expo/vector-icons';
-import { useRouter } from 'expo-router';
-import { useEffect, useMemo, useState } from 'react';
-import { Modal, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View, Image, Platform } from 'react-native';
+import { useFocusEffect, useRouter } from 'expo-router';
+import { useCallback, useMemo, useState } from 'react';
+import { Alert, Modal, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View, Image, Platform } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { api } from '@/lib/api';
+import { api, errorMessage } from '@/lib/api';
 import { useAuth } from '@/context/AuthContext';
 import { PageSkeleton } from '@/components/PageSkeleton';
+import { initials, localDateKey, parseDate } from '@/lib/format';
 
 export default function HomeScreen() {
   const router = useRouter();
@@ -14,6 +15,7 @@ export default function HomeScreen() {
   const [showXpHistory, setShowXpHistory] = useState(false);
   const [showStreakInfo, setShowStreakInfo] = useState(false);
   const [showJoin, setShowJoin] = useState(false);
+  const [annDetail, setAnnDetail] = useState<any>(null);
   const [dismissedAnn, setDismissedAnn] = useState<Set<number>>(new Set());
   const [xpClaimed, setXpClaimed] = useState(false);
   const [dash, setDash] = useState<any>(null);
@@ -21,23 +23,30 @@ export default function HomeScreen() {
   const [joinCode, setJoinCode] = useState('');
   const [xpHistory, setXpHistory] = useState<any[]>([]);
 
-  const fetchDashboard = async () => {
+  const fetchDashboard = useCallback(async () => {
     if (!token) { setLoading(false); return; }
     try {
-      const r: any = await api.get('/dashboard');
+      const r: any = await api.get('/mobile/dashboard');
       const d = r.data ?? r;
       setDash(d);
       if (d.xpHistory) setXpHistory(d.xpHistory);
-    } catch {} finally { setLoading(false); }
-  };
-
-  useEffect(() => { fetchDashboard(); }, [token]);
-  // Poll every 30s like web Dashboard.vue:75 POLL_INTERVAL_MS 30000
-  useEffect(() => {
-    if (!token) return;
-    const id = setInterval(fetchDashboard, 30000);
-    return () => clearInterval(id);
+    } catch {
+      // Network-level failures surface via the connection banner in (tabs)/_layout.
+    } finally {
+      setLoading(false);
+    }
   }, [token]);
+
+  // Fetch on focus + poll every 30s like web Dashboard.vue:75 POLL_INTERVAL_MS 30000.
+  // useFocusEffect pauses polling when the tab loses focus (battery/data).
+  useFocusEffect(
+    useCallback(() => {
+      if (!token) return;
+      fetchDashboard();
+      const id = setInterval(fetchDashboard, 30000);
+      return () => clearInterval(id);
+    }, [fetchDashboard, token])
+  );
 
   // Greeting logic like Dashboard.vue:211 personalizedGreeting
   const greetingPools: Record<string, string[]> = {
@@ -59,16 +68,16 @@ export default function HomeScreen() {
     const dueItems: any[] = [];
     for (const a of assignments) {
       if (!a.dueAtIso) continue;
-      const d = new Date(a.dueAtIso);
-      if (isNaN(d.getTime())) continue;
+      const d = parseDate(a.dueAtIso);
+      if (!d) continue;
       dueItems.push({ title: a.title, dueAt: d, isCompleted: a.submitted, isOverdue: a.isOverdue });
     }
     for (const e of upcomingExams) {
       if (e.status !== 'published') continue;
       const iso = e.starts_at_iso || e.exam_date_iso;
       if (!iso) continue;
-      const d = new Date(iso);
-      if (isNaN(d.getTime())) continue;
+      const d = parseDate(iso);
+      if (!d) continue;
       dueItems.push({ title: e.title, dueAt: d, isCompleted: e.is_completed, isOverdue: d.getTime() < Date.now() && !e.is_completed });
     }
     const start = new Date(); start.setHours(0, 0, 0, 0);
@@ -139,24 +148,24 @@ export default function HomeScreen() {
 
   const handleClaim = async () => {
     try {
-      const r = await api.post('/claim-xp');
+      await api.post('/mobile/claim-xp');
       setXpClaimed(true);
       setShowDailyClaim(false);
       fetchDashboard();
-    } catch (e: any) {
-      const msg = e?.response?.data?.message ?? 'Already claimed or not available.';
-      alert(msg);
+    } catch (e) {
+      Alert.alert('Could not claim XP', errorMessage(e));
     }
   };
 
   const handleJoin = async () => {
     if (!joinCode.trim()) return;
     try {
-      await api.post('/sections/join-by-code', { code: joinCode.trim() });
+      await api.post('/mobile/sections/join-by-code', { code: joinCode.trim() });
       setShowJoin(false);
+      setJoinCode('');
       fetchDashboard();
-    } catch (e: any) {
-      alert(e?.response?.data?.message ?? 'Invalid code.');
+    } catch (e) {
+      Alert.alert('Could not join section', errorMessage(e));
     }
   };
 
@@ -176,17 +185,22 @@ export default function HomeScreen() {
           <View style={styles.header}>
             <View style={styles.headerLeft}>
               <TouchableOpacity style={styles.avatarWrap} onPress={() => ((user as any)?.public_id ? router.push(`/u/${(user as any).public_id}` as any) : router.push('/profile' as any))}>
-                <Image source={{ uri: (user as any)?.avatar ?? 'https://i.pravatar.cc/200?img=12' }} style={styles.avatar} />
+                {(user as any)?.avatar ? (
+                  <Image source={{ uri: (user as any).avatar }} style={styles.avatar} />
+                ) : (
+                  <View style={[styles.avatar, styles.avatarInitials]}><Text style={styles.avatarInitialsText}>{initials(user?.name ?? user?.first_name)}</Text></View>
+                )}
                 <View style={styles.lvlBadge}><Text style={styles.lvlText}>Lvl {level}</Text></View>
               </TouchableOpacity>
               <View style={styles.greetingWrap}>
-                <Text style={styles.greeting} numberOfLines={1}>{greeting}, {user?.name?.split(' ')[0] ?? 'Ortiz'}</Text>
+                <Text style={styles.greeting} numberOfLines={1}>{greeting}, {user?.name?.split(' ')[0] ?? 'learner'}</Text>
                 <View style={styles.streakRow}><Text style={styles.flame}>🔥</Text><Text style={styles.streakText} numberOfLines={1}>{smarterStatus}</Text></View>
               </View>
             </View>
             <View style={styles.headerRight}>
               <TouchableOpacity style={styles.joinBtn} onPress={() => setShowJoin(true)}><Text style={styles.joinText}>Join</Text></TouchableOpacity>
-              <TouchableOpacity style={styles.refreshBtn} onPress={fetchDashboard}><Ionicons name="refresh" size={18} color="#1A1E22" /></TouchableOpacity>
+              <TouchableOpacity style={styles.refreshBtn} onPress={fetchDashboard} accessibilityLabel="Refresh"><Ionicons name="refresh" size={18} color="#1A1E22" /></TouchableOpacity>
+              <TouchableOpacity style={styles.refreshBtn} onPress={() => router.push('/more' as any)} accessibilityLabel="Menu"><Ionicons name="menu" size={18} color="#1A1E22" /></TouchableOpacity>
             </View>
           </View>
 
@@ -201,7 +215,7 @@ export default function HomeScreen() {
                 </View>
               </View>
               <View style={styles.annRight}>
-                <TouchableOpacity style={styles.detailsBtn} onPress={() => setShowXpHistory(true)}><Text style={styles.detailsText}>Details</Text></TouchableOpacity>
+                <TouchableOpacity style={styles.detailsBtn} onPress={() => setAnnDetail(a)}><Text style={styles.detailsText}>Details</Text></TouchableOpacity>
                 <TouchableOpacity style={styles.closeBtn} onPress={() => setDismissedAnn(prev => new Set(prev).add(a.id))}><Ionicons name="close" size={16} color="#1A1E22" /></TouchableOpacity>
               </View>
             </View>
@@ -219,7 +233,7 @@ export default function HomeScreen() {
 
           {/* Next assignment - real nextItem */}
           {nextItem ? (
-            <View style={styles.card}>
+            <TouchableOpacity style={styles.card} activeOpacity={0.8} onPress={() => router.navigate('/(tabs)/tasks')}>
               <View style={styles.nextRow}>
                 <View style={styles.bookIcon}><Ionicons name="book" size={20} color="#fff" /></View>
                 <View style={styles.nextText}>
@@ -228,7 +242,7 @@ export default function HomeScreen() {
                 </View>
                 <View style={styles.timePill}><Ionicons name="time-outline" size={14} color="#1A1E22" /><Text style={styles.timeText}>{Math.ceil((nextItem.dueAt.getTime() - Date.now()) / 3600000)}h</Text><Ionicons name="chevron-forward" size={14} color="#1A1E22" /></View>
               </View>
-            </View>
+            </TouchableOpacity>
           ) : (
             <View style={styles.card}><Text style={styles.cardTitle}>All caught up!</Text><Text style={{ fontSize: 12, color: '#6B7280' }}>No upcoming assignments or exams.</Text></View>
           )}
@@ -276,7 +290,7 @@ export default function HomeScreen() {
           </TouchableOpacity>
 
           {/* Leaderboard - real */}
-          <TouchableOpacity style={styles.card} onPress={() => setShowXpHistory(true)}>
+          <TouchableOpacity style={styles.card} onPress={() => router.push('/leaderboard' as any)}>
             <View style={styles.leaderRow}>
               <View style={styles.leaderIcon}><Ionicons name="people" size={18} color="#3A7D5C" /></View>
               <View style={{ flex: 1 }}><Text style={styles.leaderTitle}>Leaderboard</Text><Text style={styles.leaderSub}>{primaryBoard ? `${primaryBoard.sectionName} · ${primaryBoard.totalPlayers} students` : 'No leaderboard yet'}</Text></View>
@@ -296,7 +310,7 @@ export default function HomeScreen() {
                     {Array.from({ length: 18 }).map((_, col) => {
                       const daysAgo = (17 - col) * 7 + (3 - row) * 1;
                       const d = new Date(); d.setDate(d.getDate() - daysAgo);
-                      const key = d.toISOString().slice(0, 10);
+                      const key = localDateKey(d);
                       const active = loginDates.includes(key);
                       const colors = active ? ['#3A7D5C', '#2F6B4F', '#1E4A32'] : ['#F0F0F0', '#F0F0F0', '#F0F0F0'];
                       const c = active ? (col > 14 ? colors[0] : col > 10 ? colors[1] : colors[2]) : colors[0];
@@ -333,7 +347,7 @@ export default function HomeScreen() {
                 {xpHistory.length === 0 ? <Text style={{ textAlign: 'center', color: '#6B7280', padding: 20 }}>No history yet</Text> : xpHistory.slice(0, 30).map((h: any) => (
                   <View key={h.id} style={styles.historyRow}>
                     <View style={styles.historyIcon}><Ionicons name="flash" size={14} color="#D96A3E" /></View>
-                    <View style={{ flex: 1 }}><Text style={styles.historyTitle}>{h.reason}</Text><Text style={styles.historyDesc}>{h.description ?? ''} · {new Date(h.createdAt).toLocaleDateString()}</Text></View>
+                    <View style={{ flex: 1 }}><Text style={styles.historyTitle}>{h.reason}</Text><Text style={styles.historyDesc}>{h.description ?? ''} · {parseDate(h.createdAt)?.toLocaleDateString() ?? ''}</Text></View>
                     <Text style={styles.historyAmt}>+{h.amount} XP</Text>
                   </View>
                 ))}
@@ -366,6 +380,20 @@ export default function HomeScreen() {
             </View>
           </View>
         </Modal>
+
+        {/* Announcement details */}
+        <Modal visible={annDetail !== null} transparent animationType="fade" onRequestClose={() => setAnnDetail(null)}>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalCard}>
+              <Text style={styles.modalTitle}>Announcement</Text>
+              <Text style={{ fontSize: 14, fontWeight: '800', color: '#1A1E22', marginTop: 6 }}>{annDetail?.title}</Text>
+              <Text style={{ fontSize: 13, color: '#6B7280', marginTop: 8, lineHeight: 18 }}>
+                {annDetail?.content ?? annDetail?.body ?? annDetail?.message ?? annDetail?.text ?? 'No additional details.'}
+              </Text>
+              <TouchableOpacity style={styles.modalPrimary} onPress={() => setAnnDetail(null)}><Text style={styles.modalPrimaryText}>Close</Text></TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
       </View>
     </SafeAreaView>
   );
@@ -381,6 +409,8 @@ const styles = StyleSheet.create({
   headerLeft: { flexDirection: 'row', alignItems: 'center', gap: 10, flex: 1, minWidth: 0 },
   avatarWrap: { position: 'relative', flexShrink: 0 },
   avatar: { width: 52, height: 52, borderRadius: 26, backgroundColor: '#EAE5DE' },
+  avatarInitials: { alignItems: 'center', justifyContent: 'center', backgroundColor: '#D96A3E' },
+  avatarInitialsText: { color: '#fff', fontSize: 18, fontWeight: '800' },
   lvlBadge: { position: 'absolute', bottom: -4, right: -4, backgroundColor: '#1A1E22', paddingHorizontal: 7, paddingVertical: 2, borderRadius: 10 },
   lvlText: { color: '#fff', fontSize: 10, fontWeight: '700' },
   greetingWrap: { flex: 1, minWidth: 0 },

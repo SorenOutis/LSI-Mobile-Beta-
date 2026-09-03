@@ -1,0 +1,2089 @@
+From e5fd82654addcec5f8007f6ee3e58dc5ca29af5b Mon Sep 17 00:00:00 2001
+From: Soren Outis <soren@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 03:08:47 +0000
+Subject: [PATCH] feat: stateless mobile API with token auth (routes/api.php)
+
+Adds a JSON surface at /api/mobile/* for the LSI mobile app, built so the
+deployed web app is untouched:
+
+- Personal access tokens (api_tokens table, SHA-256 stored) issued by
+  POST /api/mobile/auth/login and revoked by /auth/logout. No new package:
+  an auth.mobile middleware binds the token user to the request and the
+  default web guard for the duration of the request, so every existing
+  policy/gate/controller keeps working unchanged.
+- Login reuses Fortify's credential check, the login_enabled Setting, and
+  Fortify's own TOTP provider + recovery codes, so mobile and web accept
+  exactly the same second factors. Rate limited (5/min per IP+email).
+- Data endpoints reuse the same controller methods the web calls; actions
+  that end in a redirect return JSON instead when the request comes from
+  /api/mobile/* (MobileApi::isRequest). Dashboard/exam/courses/assignments/
+  public profile payloads are extracted into shared builders.
+- student.page.mobile mirrors the student-page availability controls with a
+  JSON 423; banned users get a 403 JSON instead of the web redirect.
+- Pest coverage: token lifecycle, 2FA (TOTP + recovery codes), banned
+  users, exam start/save/submit flow, data endpoints, and web-route
+  regression tests.
+---
+ .../AnonymousMessageController.php            |  11 +-
+ .../Api/Mobile/MobileAuthController.php       | 211 +++++++
+ .../Api/Mobile/MobileCalendarController.php   |  33 ++
+ app/Http/Controllers/AssignmentController.php |  37 +-
+ app/Http/Controllers/CourseController.php     | 100 +++-
+ app/Http/Controllers/DashboardController.php  |  50 +-
+ app/Http/Controllers/ExamController.php       |  46 +-
+ .../Controllers/ProfileKudoController.php     |   8 +-
+ .../Controllers/PublicProfileController.php   |  23 +-
+ .../Settings/ProfileController.php            |   6 +
+ app/Http/Controllers/UserFollowController.php |  14 +-
+ .../AuthenticateWithMobileToken.php           |  81 +++
+ .../EnsureMobileUserIsNotBanned.php           |  26 +
+ .../EnsureStudentPageIsAvailableMobile.php    |  33 ++
+ app/Models/ApiToken.php                       |  67 +++
+ app/Providers/AppServiceProvider.php          |   6 +
+ app/Support/MobileApi.php                     |  22 +
+ app/Support/MobileUser.php                    |  57 ++
+ bootstrap/app.php                             |   9 +
+ ...6_09_03_100000_create_api_tokens_table.php |  31 +
+ routes/api.php                                | 132 +++++
+ tests/Feature/MobileApiTest.php               | 548 ++++++++++++++++++
+ 22 files changed, 1503 insertions(+), 48 deletions(-)
+ create mode 100644 app/Http/Controllers/Api/Mobile/MobileAuthController.php
+ create mode 100644 app/Http/Controllers/Api/Mobile/MobileCalendarController.php
+ create mode 100644 app/Http/Middleware/AuthenticateWithMobileToken.php
+ create mode 100644 app/Http/Middleware/EnsureMobileUserIsNotBanned.php
+ create mode 100644 app/Http/Middleware/EnsureStudentPageIsAvailableMobile.php
+ create mode 100644 app/Models/ApiToken.php
+ create mode 100644 app/Support/MobileApi.php
+ create mode 100644 app/Support/MobileUser.php
+ create mode 100644 database/migrations/2026_09_03_100000_create_api_tokens_table.php
+ create mode 100644 routes/api.php
+ create mode 100644 tests/Feature/MobileApiTest.php
+
+diff --git a/app/Http/Controllers/AnonymousMessageController.php b/app/Http/Controllers/AnonymousMessageController.php
+index ee394db..919b84c 100644
+--- a/app/Http/Controllers/AnonymousMessageController.php
++++ b/app/Http/Controllers/AnonymousMessageController.php
+@@ -3,6 +3,7 @@
+ namespace App\Http\Controllers;
+ 
+ use App\Models\AnonymousMessage;
++use App\Support\MobileApi;
+ use Illuminate\Http\Request;
+ use Illuminate\Pagination\Cursor;
+ use Illuminate\Support\Facades\DB;
+@@ -31,7 +32,7 @@ public function feed(Request $request)
+         ));
+     }
+ 
+-    public function like(AnonymousMessage $message)
++    public function like(Request $request, AnonymousMessage $message)
+     {
+         $userId = auth()->id();
+ 
+@@ -56,6 +57,10 @@ public function like(AnonymousMessage $message)
+             $message->increment('likes_count');
+         }
+ 
++        if (MobileApi::isRequest($request)) {
++            return response()->json(['liked' => ! $like]);
++        }
++
+         return back();
+     }
+ 
+@@ -114,6 +119,10 @@ public function store(Request $request)
+             'is_approved' => false,
+         ]);
+ 
++        if (MobileApi::isRequest($request)) {
++            return response()->json(['sent' => true]);
++        }
++
+         return back()->with('success', 'Your anonymous message has been sent for approval!');
+     }
+ }
+diff --git a/app/Http/Controllers/Api/Mobile/MobileAuthController.php b/app/Http/Controllers/Api/Mobile/MobileAuthController.php
+new file mode 100644
+index 0000000..442bd49
+--- /dev/null
++++ b/app/Http/Controllers/Api/Mobile/MobileAuthController.php
+@@ -0,0 +1,211 @@
++<?php
++
++namespace App\Http\Controllers\Api\Mobile;
++
++use App\Http\Controllers\Controller;
++use App\Models\ApiToken;
++use App\Models\Setting;
++use App\Models\User;
++use App\Support\MobileUser;
++use Illuminate\Auth\Events\Login;
++use Illuminate\Http\JsonResponse;
++use Illuminate\Http\Request;
++use Illuminate\Support\Facades\Hash;
++use Illuminate\Validation\Rules\Password;
++use Illuminate\Validation\ValidationException;
++use Laravel\Fortify\Actions\ConfirmTwoFactorAuthentication;
++use Laravel\Fortify\Actions\DisableTwoFactorAuthentication;
++use Laravel\Fortify\Actions\EnableTwoFactorAuthentication;
++use Laravel\Fortify\Contracts\TwoFactorAuthenticationProvider;
++use Laravel\Fortify\Fortify;
++
++/**
++ * Authentication and account management for the stateless mobile client.
++ *
++ * Credential and two-factor verification deliberately reuse Fortify's own
++ * actions and TOTP provider, so the mobile app and the web app accept
++ * exactly the same codes and passwords.
++ */
++class MobileAuthController extends Controller
++{
++    public function login(Request $request): JsonResponse
++    {
++        $request->validate([
++            'email' => ['required', 'string', 'email'],
++            'password' => ['required', 'string'],
++            'two_factor_code' => ['sometimes', 'nullable', 'string', 'max:64'],
++        ]);
++
++        // Mirror EnsureLoginIsEnabled: when an admin disables login, only
++        // admins may still sign in.
++        if (! (bool) Setting::get('login_enabled', true)) {
++            $candidate = User::where(Fortify::username(), $request->input('email'))->first();
++
++            throw ValidationException::withMessages([
++                Fortify::username() => [Setting::get('login_disabled_message', 'Login is currently disabled.')],
++            ]);
++        }
++
++        $user = User::where(Fortify::username(), $request->input('email'))->first();
++
++        if ($user === null || ! Hash::check($request->input('password'), $user->password)) {
++            throw ValidationException::withMessages([
++                'email' => ['These credentials do not match our records.'],
++            ]);
++        }
++
++        if ($user->is_banned) {
++            return response()->json([
++                'message' => 'Your account is currently suspended. Please contact your teacher.',
++            ], 403);
++        }
++
++        if ($user->hasEnabledTwoFactorAuthentication()) {
++            $code = trim((string) $request->input('two_factor_code', ''));
++
++            if ($code === '') {
++                // Password is good; the client now needs the second factor.
++                return response()->json(['requires_two_factor' => true]);
++            }
++
++            if (! $this->verifyTwoFactorCode($user, $code)) {
++                throw ValidationException::withMessages([
++                    'two_factor_code' => ['The provided two factor authentication code was invalid.'],
++                ]);
++            }
++        }
++
++        [$token] = ApiToken::issue($user, 'mobile-app');
++
++        // Same hook the web login fires, so admin login notifications stay
++        // in parity regardless of which client signed the user in.
++        event(new Login('web', $user));
++
++        return response()->json([
++            'token' => $token,
++            'user' => MobileUser::present($user->fresh()),
++        ]);
++    }
++
++    public function logout(Request $request): JsonResponse
++    {
++        ApiToken::revokeAllFor($request->user());
++
++        return response()->json(['ok' => true]);
++    }
++
++    public function me(Request $request): JsonResponse
++    {
++        return response()->json(['user' => MobileUser::present($request->user()->fresh(['sections']))]);
++    }
++
++    public function updatePassword(Request $request): JsonResponse
++    {
++        $validated = $request->validate([
++            'current_password' => ['required', 'current_password'],
++            'password' => ['required', 'confirmed', 'string', Password::default()],
++        ]);
++
++        $request->user()->update([
++            'password' => Hash::make($validated['password']),
++        ]);
++
++        return response()->json([
++            'ok' => true,
++            'message' => 'Your password has been updated. Use it the next time you sign in.',
++        ]);
++    }
++
++    // ── Two-factor authentication ────────────────────────────────────
++
++    public function twoFactorStatus(Request $request): JsonResponse
++    {
++        return response()->json([
++            'enabled' => $request->user()->hasEnabledTwoFactorAuthentication(),
++        ]);
++    }
++
++    public function twoFactorEnable(Request $request): JsonResponse
++    {
++        $user = $request->user();
++
++        if ($user->two_factor_secret !== null && ! $user->hasEnabledTwoFactorAuthentication()) {
++            // A secret exists but was never confirmed: finish that flow
++            // (re-issuing here would orphan the codes the user already has).
++            throw ValidationException::withMessages([
++                'two_factor' => ['A two-factor setup is in progress. Confirm it with a code from your authenticator app.'],
++            ]);
++        }
++
++        if ($user->hasEnabledTwoFactorAuthentication()) {
++            throw ValidationException::withMessages([
++                'two_factor' => ['Two-factor authentication is already enabled.'],
++            ]);
++        }
++
++        app(EnableTwoFactorAuthentication::class)($user);
++        $user->refresh();
++
++        $secret = Fortify::currentEncrypter()->decrypt($user->two_factor_secret);
++
++        return response()->json([
++            'enabled' => false,
++            'secret' => $secret,
++            'otpauth_url' => app(TwoFactorAuthenticationProvider::class)->qrCodeUrl(
++                config('app.name'),
++                $user->{Fortify::username()},
++                $secret,
++            ),
++            'recovery_codes' => $user->recoveryCodes(),
++        ]);
++    }
++
++    public function twoFactorConfirm(Request $request): JsonResponse
++    {
++        $request->validate(['code' => ['required', 'string', 'max:64']]);
++
++        app(ConfirmTwoFactorAuthentication::class)($request->user(), $request->input('code'));
++
++        return response()->json(['enabled' => true]);
++    }
++
++    public function twoFactorDisable(Request $request): JsonResponse
++    {
++        app(DisableTwoFactorAuthentication::class)($request->user());
++
++        return response()->json(['enabled' => false]);
++    }
++
++    /**
++     * Accept either a TOTP code (verified with Fortify's own Google2FA
++     * provider — identical to the web flow) or one of the user's recovery
++     * codes, which are single-use.
++     */
++    private function verifyTwoFactorCode(User $user, string $code): bool
++    {
++        $secret = $user->two_factor_secret;
++
++        if ($secret !== null && $secret !== '') {
++            $verified = app(TwoFactorAuthenticationProvider::class)->verify(
++                Fortify::currentEncrypter()->decrypt($secret),
++                $code,
++            );
++
++            if ($verified) {
++                return true;
++            }
++        }
++
++        $recoveryCodes = $user->two_factor_recovery_codes !== null
++            ? $user->recoveryCodes()
++            : [];
++
++        if (in_array($code, $recoveryCodes, true)) {
++            $user->replaceRecoveryCode($code);
++
++            return true;
++        }
++
++        return false;
++    }
++}
+diff --git a/app/Http/Controllers/Api/Mobile/MobileCalendarController.php b/app/Http/Controllers/Api/Mobile/MobileCalendarController.php
+new file mode 100644
+index 0000000..36a4fe5
+--- /dev/null
++++ b/app/Http/Controllers/Api/Mobile/MobileCalendarController.php
+@@ -0,0 +1,33 @@
++<?php
++
++namespace App\Http\Controllers\Api\Mobile;
++
++use App\Http\Controllers\CalendarController;
++use App\Http\Controllers\Controller;
++use App\Services\CalendarEventService;
++use Illuminate\Http\JsonResponse;
++use Illuminate\Http\Request;
++
++/**
++ * JSON calendar for the mobile app: the same event payload the Inertia
++ * Calendar page receives (see CalendarController), minus the page chrome.
++ */
++class MobileCalendarController extends Controller
++{
++    public function __construct(
++        protected CalendarEventService $calendarEvents,
++    ) {}
++
++    public function __invoke(Request $request): JsonResponse
++    {
++        $user = $request->user();
++
++        $from = now()->startOfMonth()->subMonths(CalendarController::MONTHS_BACK);
++        $to = now()->endOfMonth()->addMonths(CalendarController::MONTHS_FORWARD);
++
++        return response()->json(array_merge(
++            ['todayKey' => now()->toDateString()],
++            $this->calendarEvents->forUser($user, $from, $to),
++        ));
++    }
++}
+diff --git a/app/Http/Controllers/AssignmentController.php b/app/Http/Controllers/AssignmentController.php
+index 8ee85ba..85b8985 100644
+--- a/app/Http/Controllers/AssignmentController.php
++++ b/app/Http/Controllers/AssignmentController.php
+@@ -9,7 +9,9 @@
+ use App\Models\Submission;
+ use App\Models\User;
+ use App\Services\AssignmentGroupService;
++use App\Support\MobileApi;
+ use App\Support\PublicFileUrl;
++use Illuminate\Http\JsonResponse;
+ use Illuminate\Http\Request;
+ use Inertia\Inertia;
+ 
+@@ -19,7 +21,26 @@ class AssignmentController extends Controller
+ 
+     public function index()
+     {
+-        $user = auth()->user();
++        return Inertia::render('Assignments', [
++            'assignments' => $this->buildAssignments(auth()->user()),
++        ]);
++    }
++
++    /**
++     * JSON assignments for the stateless mobile API.
++     */
++    public function mobileIndex(Request $request): JsonResponse
++    {
++        return response()->json([
++            'assignments' => $this->buildAssignments($request->user()),
++        ]);
++    }
++
++    /**
++     * @return array<int, array<string, mixed>>
++     */
++    private function buildAssignments(User $user): array
++    {
+         $sectionIds = $user->sections()->pluck('sections.id');
+ 
+         // Assignments are targeted at sections. A student only sees the ones
+@@ -79,7 +100,7 @@ public function index()
+                 ->get()
+                 ->keyBy('assignment_id');
+ 
+-        return Inertia::render('Assignments', [
++        return [
+             'assignments' => $assignments->map(function ($assignment) use ($submissions, $uploaders, $groups, $pendingByGroup, $incomingInvites) {
+                 $submission = $submissions->get($assignment->id);
+                 $pivot = $submission?->pivot ?? $submission;
+@@ -157,8 +178,8 @@ public function index()
+                         'file_extension' => $filePath ? strtolower(pathinfo($filePath, PATHINFO_EXTENSION)) : null,
+                     ] : null,
+                 ];
+-            })->values(),
+-        ]);
++            })->values()->all(),
++        ];
+     }
+ 
+     /**
+@@ -194,6 +215,10 @@ public function markFeedbackSeen(Request $request, Assignment $assignment)
+             ->where('user_id', $request->user()->id)
+             ->update(['feedback_seen_at' => now()]);
+ 
++        if (MobileApi::isRequest($request)) {
++            return response()->json(['ok' => true]);
++        }
++
+         return back();
+     }
+ 
+@@ -236,6 +261,10 @@ public function store(Request $request, Assignment $assignment)
+         // Group activity: share the file with every member.
+         $service->submitFile($assignment, $user, $path);
+ 
++        if (MobileApi::isRequest($request)) {
++            return response()->json(['submitted' => true]);
++        }
++
+         return back()->with('success', 'Assignment submitted successfully!');
+     }
+ }
+diff --git a/app/Http/Controllers/CourseController.php b/app/Http/Controllers/CourseController.php
+index 00f7393..878a6c5 100644
+--- a/app/Http/Controllers/CourseController.php
++++ b/app/Http/Controllers/CourseController.php
+@@ -6,6 +6,9 @@
+ use App\Models\Lesson;
+ use App\Models\LessonUserProgress;
+ use App\Models\Season;
++use App\Models\User;
++use App\Support\MobileApi;
++use Illuminate\Http\JsonResponse;
+ use Illuminate\Http\Request;
+ use Inertia\Inertia;
+ 
+@@ -23,7 +26,26 @@ class CourseController extends Controller
+      */
+     public function index()
+     {
+-        $user = auth()->user();
++        return Inertia::render('Courses/Index', [
++            'courses' => $this->buildCourseList(auth()->user()),
++        ]);
++    }
++
++    /**
++     * JSON course catalog for the stateless mobile API.
++     */
++    public function mobileIndex(Request $request): JsonResponse
++    {
++        return response()->json([
++            'courses' => $this->buildCourseList($request->user())->values()->all(),
++        ]);
++    }
++
++    /**
++     * @return \Illuminate\Database\Eloquent\Collection<int, Course>
++     */
++    private function buildCourseList(User $user)
++    {
+         $currentSeason = Season::current();
+ 
+         $courses = $user->courses()
+@@ -56,9 +78,7 @@ public function index()
+                 ];
+             });
+ 
+-        return Inertia::render('Courses/Index', [
+-            'courses' => $courses,
+-        ]);
++        return $courses;
+     }
+ 
+     /**
+@@ -66,8 +86,22 @@ public function index()
+      */
+     public function show(Course $course)
+     {
+-        $user = auth()->user();
++        return Inertia::render('Courses/Show', $this->buildCourseDetail($course, auth()->user()));
++    }
+ 
++    /**
++     * JSON course detail (modules + lessons) for the stateless mobile API.
++     */
++    public function mobileShow(Request $request, Course $course): JsonResponse
++    {
++        return response()->json($this->buildCourseDetail($course, $request->user()));
++    }
++
++    /**
++     * @return array{course: array<string, mixed>, modules: array<int, array<string, mixed>>}
++     */
++    private function buildCourseDetail(Course $course, User $user): array
++    {
+         // Check enrollment
+         if (! $user->is_admin && ! $user->courses()->where('course_id', $course->id)->exists()) {
+             abort(403, 'You are not enrolled in this course.');
+@@ -111,7 +145,7 @@ public function show(Course $course)
+             ];
+         })->values();
+ 
+-        return Inertia::render('Courses/Show', [
++        return [
+             'course' => [
+                 'id' => $course->id,
+                 'name' => $course->name,
+@@ -124,7 +158,7 @@ public function show(Course $course)
+                     : 0,
+             ],
+             'modules' => $modules,
+-        ]);
++        ];
+     }
+ 
+     /**
+@@ -132,8 +166,27 @@ public function show(Course $course)
+      */
+     public function lesson(Course $course, Lesson $lesson)
+     {
+-        $user = auth()->user();
++        return Inertia::render('Courses/Lesson', $this->buildLesson(
++            $course,
++            $lesson,
++            auth()->user(),
++            session()->pull('quizResult'),
++        ));
++    }
++
++    /**
++     * JSON lesson (content + quiz) for the stateless mobile API.
++     */
++    public function mobileLesson(Request $request, Course $course, Lesson $lesson): JsonResponse
++    {
++        return response()->json($this->buildLesson($course, $lesson, $request->user()));
++    }
+ 
++    /**
++     * @return array<string, mixed>
++     */
++    private function buildLesson(Course $course, Lesson $lesson, User $user, ?array $quizResult = null): array
++    {
+         // Verify lesson belongs to this course
+         if ($lesson->module->course_id !== $course->id) {
+             abort(404);
+@@ -189,16 +242,13 @@ public function lesson(Course $course, Lesson $lesson)
+             ->where('lesson_id', $lesson->id)
+             ->first();
+ 
+-        // Get quiz result from flash session (set by submitQuiz)
+-        $quizResult = session()->pull('quizResult');
+-
+         // Get previous and next lesson IDs for navigation
+         $allLessonIds = $course->modules->pluck('lessons.*.id')->flatten()->values();
+         $currentIndex = $allLessonIds->search($lesson->id);
+         $prevLessonId = $currentIndex > 0 ? $allLessonIds[$currentIndex - 1] : null;
+         $nextLessonId = $currentIndex < $allLessonIds->count() - 1 ? $allLessonIds[$currentIndex + 1] : null;
+ 
+-        return Inertia::render('Courses/Lesson', [
++        return [
+             'course' => [
+                 'id' => $course->id,
+                 'name' => $course->name,
+@@ -243,7 +293,7 @@ public function lesson(Course $course, Lesson $lesson)
+                 'completedLessons' => $completedLessons,
+                 'progress' => $totalLessons > 0 ? round(($completedLessons / $totalLessons) * 100) : 0,
+             ],
+-        ]);
++        ];
+     }
+ 
+     /**
+@@ -305,6 +355,10 @@ public function submitQuiz(Request $request, Course $course, Lesson $lesson)
+ 
+         $quiz = $lesson->quiz;
+         if (! $quiz) {
++            if (MobileApi::isRequest($request)) {
++                return response()->json(['errors' => ['quiz' => ['This lesson has no quiz.']]], 422);
++            }
++
+             return redirect()->back()->withErrors(['quiz' => 'This lesson has no quiz.']);
+         }
+ 
+@@ -350,6 +404,10 @@ public function submitQuiz(Request $request, Course $course, Lesson $lesson)
+ 
+         // Check if user has attempts remaining
+         if ($quiz->allowed_attempts > 0 && $attempts > $quiz->allowed_attempts) {
++            if (MobileApi::isRequest($request)) {
++                return response()->json(['errors' => ['quiz' => ['You have used all your allowed attempts for this quiz.']]], 422);
++            }
++
+             return redirect()->back()->withErrors(['quiz' => 'You have used all your allowed attempts for this quiz.']);
+         }
+ 
+@@ -385,15 +443,21 @@ public function submitQuiz(Request $request, Course $course, Lesson $lesson)
+             ]);
+         }
+ 
+-        return redirect()->route('courses.lesson', [
+-            'course' => $course->id,
+-            'lesson' => $lesson->id,
+-        ])->with('quizResult', [
++        $quizResult = [
+             'passed' => $passed,
+             'score' => $score,
+             'passScore' => $quiz->pass_score,
+             'totalQuestions' => $totalQuestions,
+             'correctAnswers' => $correctAnswers,
+-        ]);
++        ];
++
++        if (MobileApi::isRequest($request)) {
++            return response()->json(['quizResult' => $quizResult]);
++        }
++
++        return redirect()->route('courses.lesson', [
++            'course' => $course->id,
++            'lesson' => $lesson->id,
++        ])->with('quizResult', $quizResult);
+     }
+ }
+diff --git a/app/Http/Controllers/DashboardController.php b/app/Http/Controllers/DashboardController.php
+index 8219377..bd71959 100644
+--- a/app/Http/Controllers/DashboardController.php
++++ b/app/Http/Controllers/DashboardController.php
+@@ -12,6 +12,7 @@
+ use App\Services\LeaderboardService;
+ use App\Services\StreakService;
+ use App\Services\UpcomingExamsService;
++use Illuminate\Http\JsonResponse;
+ use Illuminate\Http\Request;
+ use Illuminate\Support\Facades\DB;
+ use Illuminate\Support\Facades\Storage;
+@@ -42,6 +43,38 @@ public function __construct(
+     ) {}
+ 
+     public function __invoke(Request $request)
++    {
++        $promptShownOn = $request->session()->get('daily_claim_prompt_shown_on');
++        $payload = $this->buildPayload($request, $promptShownOn);
++
++        // Consume the per-day flag only when the prompt is actually delivered
++        // now. Users without a section see the section-selection modal first,
++        // so their prompt (and flag) is deferred: either the client marks it as
++        // shown via api/claim-xp/prompt-shown when it opens, or it is set here
++        // on the reload after they join a section.
++        if ($payload['claimXp']['showPrompt'] && $request->user()->sections->isNotEmpty()) {
++            $request->session()->put('daily_claim_prompt_shown_on', now()->toDateString());
++        }
++
++        return inertia('Dashboard', $payload);
++    }
++
++    /**
++     * JSON dashboard for the stateless mobile API. Same payload as the
++     * Inertia page; the claim-prompt flag is client-side there, so no session
++     * is involved.
++     */
++    public function mobile(Request $request): JsonResponse
++    {
++        return response()->json($this->buildPayload($request));
++    }
++
++    /**
++     * @param  mixed  $promptShownOn  The session value on the web route, or
++     *                                null for stateless (mobile) requests.
++     * @return array<string, mixed>
++     */
++    private function buildPayload(Request $request, mixed $promptShownOn = null): array
+     {
+         $user = $request->user();
+         $currentSeason = Season::current();
+@@ -225,19 +258,10 @@ public function __invoke(Request $request)
+         // open), so on later logins/visits with a fresh daily XP available only
+         // the inline claim card would render — the popup would never show again.
+         // Keying the flag by date re-offers the popup on every new day (i.e. on
+-        // the next login) while the reward is still unclaimed.
+-        $promptShownOn = $request->session()->get('daily_claim_prompt_shown_on');
++        // the next login) while the reward is still unclaimed. Stateless
++        // requests pass null (never shown) and keep their own per-day flag.
+         $showClaimPrompt = $canClaim && $promptShownOn !== now()->toDateString();
+ 
+-        // Consume the per-day flag only when the prompt is actually delivered
+-        // now. Users without a section see the section-selection modal first,
+-        // so their prompt (and flag) is deferred: either the client marks it as
+-        // shown via api/claim-xp/prompt-shown when it opens, or it is set here
+-        // on the reload after they join a section.
+-        if ($user->sections->isNotEmpty() && $showClaimPrompt) {
+-            $request->session()->put('daily_claim_prompt_shown_on', now()->toDateString());
+-        }
+-
+         $historyQuery = $user->gamificationHistories()
+             ->when($currentSeason, fn ($query) => $query->where('season_id', $currentSeason->id))
+             // Back-office manual XP/point adjustments are audit-only and
+@@ -286,7 +310,7 @@ public function __invoke(Request $request)
+                 'isClaim' => in_array($entry->reason, ['Daily Claim', 'Bonus Claim'], true),
+             ])->values();
+ 
+-        return inertia('Dashboard', [
++        return [
+             'claimXp' => [
+                 'enabled' => $this->claimXpService->isEnabled(),
+                 'canClaim' => $canClaim,
+@@ -348,6 +372,6 @@ public function __invoke(Request $request)
+             ] : null,
+             'sectionName' => $user->sections->pluck('name')->join(', '),
+             'availableSeasons' => $availableSeasons,
+-        ]);
++        ];
+     }
+ }
+diff --git a/app/Http/Controllers/ExamController.php b/app/Http/Controllers/ExamController.php
+index 04fd0c5..51d1eda 100644
+--- a/app/Http/Controllers/ExamController.php
++++ b/app/Http/Controllers/ExamController.php
+@@ -23,6 +23,7 @@
+ use App\Support\ExamPartSerializer;
+ use App\Support\IdentificationAnswerMatcher;
+ use App\Support\MatchingAnswerMatcher;
++use App\Support\MobileApi;
+ use Carbon\CarbonInterface as Carbon;
+ use Illuminate\Database\QueryException;
+ use Illuminate\Http\JsonResponse;
+@@ -228,7 +229,38 @@ public function show(Exam $exam)
+             abort(404);
+         }
+ 
+-        $user = auth()->user();
++        $payload = $this->buildShowPayload($exam, auth()->user(), session()->pull('submitted_part'));
++
++        return Inertia::render('Exams/Show', array_merge($payload, [
++            'realtimeChannel' => "exam.{$exam->id}.student.".auth()->id(),
++        ]));
++    }
++
++    /**
++     * JSON exam for the stateless mobile API: the same payload as the Inertia
++     * page, minus the Pusher channel (mobile has no realtime subscription)
++     * and minus the flash-based just-submitted part id (the app tracks its
++     * own submission state client-side).
++     */
++    public function mobileShow(Request $request, Exam $exam): JsonResponse
++    {
++        $this->assertCanAccess($exam);
++
++        if ($exam->status === 'draft') {
++            abort(404);
++        }
++
++        return response()->json($this->buildShowPayload($exam, $request->user()));
++    }
++
++    /**
++     * Build the exam-taking payload shared by the Inertia page and the mobile
++     * API. `realtimeChannel` is added by the Inertia caller only.
++     *
++     * @return array<string, mixed>
++     */
++    private function buildShowPayload(Exam $exam, User $user, ?int $submittedPartId = null): array
++    {
+ 
+         // Opening the exam is what hands a student their set, and the set is
+         // sticky from then on: reloading or resuming always shows the same
+@@ -279,9 +311,6 @@ public function show(Exam $exam)
+             ])
+             ->toArray();
+ 
+-        // Check if we just submitted a part (from flash session)
+-        $submittedPartId = session()->pull('submitted_part');
+-
+         // ⚠️ Answer keys are only serialized once the exam is closed AND the
+         // student has actually participated. A student who never answered a
+         // closed exam must not be able to open "review results" and read the
+@@ -302,7 +331,7 @@ public function show(Exam $exam)
+             || $reveal
+             || (bool) auth()->user()->is_admin;
+ 
+-        return Inertia::render('Exams/Show', [
++        return [
+             'exam' => array_merge($exam->withoutRelations()->toArray(), [
+                 'parts' => ExamPartSerializer::many($parts, $reveal, $includeQuestions),
+                 // Students see which set they are taking on the exam page too.
+@@ -320,8 +349,7 @@ public function show(Exam $exam)
+             'xpAward' => $this->examXpAwardService->serialize(
+                 $this->examXpAwardService->awardIfEligible($user, $exam, $set)
+             ),
+-            'realtimeChannel' => "exam.{$exam->id}.student.{$userId}",
+-        ]);
++        ];
+     }
+ 
+     /**
+@@ -688,6 +716,10 @@ public function submitPart(SubmitExamPartRequest $request, Exam $exam, ExamPart
+         // Accuracy XP waits until every essay has finished grading.
+         $this->examXpAwardService->awardIfEligible($request->user(), $exam);
+ 
++        if (MobileApi::isRequest($request)) {
++            return response()->json(['submitted_part' => $examPart->id]);
++        }
++
+         return redirect('/exams/'.$exam->id)->with('submitted_part', $examPart->id);
+     }
+ 
+diff --git a/app/Http/Controllers/ProfileKudoController.php b/app/Http/Controllers/ProfileKudoController.php
+index 88d33e3..50efcb9 100644
+--- a/app/Http/Controllers/ProfileKudoController.php
++++ b/app/Http/Controllers/ProfileKudoController.php
+@@ -4,8 +4,10 @@
+ 
+ use App\Models\User;
+ use App\Notifications\StudentActivityNotification;
++use App\Support\MobileApi;
+ use Illuminate\Http\RedirectResponse;
+ use Illuminate\Http\Request;
++use Illuminate\Http\Response;
+ use Illuminate\Support\Facades\DB;
+ use Illuminate\Validation\Rule;
+ 
+@@ -18,7 +20,7 @@ class ProfileKudoController extends Controller
+         'keep-going' => 'Keep going',
+     ];
+ 
+-    public function store(Request $request, User $user): RedirectResponse
++    public function store(Request $request, User $user): Response
+     {
+         $sender = $request->user();
+         abort_if($sender->is($user), 422, 'You cannot send yourself a kudo.');
+@@ -54,6 +56,10 @@ public function store(Request $request, User $user): RedirectResponse
+             ]));
+         }
+ 
++        if (MobileApi::isRequest($request)) {
++            return response()->json(['ok' => true, 'type' => $data['type']]);
++        }
++
+         return back();
+     }
+ }
+diff --git a/app/Http/Controllers/PublicProfileController.php b/app/Http/Controllers/PublicProfileController.php
+index cb2e6bf..42c3742 100644
+--- a/app/Http/Controllers/PublicProfileController.php
++++ b/app/Http/Controllers/PublicProfileController.php
+@@ -7,6 +7,7 @@
+ use App\Models\SeasonProgress;
+ use App\Models\User;
+ use App\Support\PublicFileUrl;
++use Illuminate\Http\JsonResponse;
+ use Illuminate\Http\Request;
+ use Illuminate\Support\Carbon;
+ use Illuminate\Support\Facades\DB;
+@@ -17,6 +18,24 @@
+ class PublicProfileController extends Controller
+ {
+     public function show(Request $request, User $user)
++    {
++        return Inertia::render('User/PublicProfile', $this->buildPayload($request, $user));
++    }
++
++    /**
++     * JSON public profile for the stateless mobile API.
++     */
++    public function mobileShow(Request $request, User $user): JsonResponse
++    {
++        return response()->json($this->buildPayload($request, $user));
++    }
++
++    /**
++     * Build the profile payload shared by the Inertia page and the mobile API.
++     *
++     * @return array<string, mixed>
++     */
++    private function buildPayload(Request $request, User $user): array
+     {
+         $viewer = $request->user();
+         Gate::authorize('viewPublicProfile', $user);
+@@ -243,7 +262,7 @@ public function show(Request $request, User $user)
+                 ])->values()->all();
+         }
+ 
+-        return Inertia::render('User/PublicProfile', [
++        return [
+             'profileUser' => [
+                 'id' => (string) $user->public_id,
+                 'name' => $user->name,
+@@ -287,7 +306,7 @@ public function show(Request $request, User $user)
+             'recentKudos' => $recentKudos,
+             'followers' => $followers,
+             'following' => $following,
+-        ]);
++        ];
+     }
+ 
+     private function scopeToSections($query, $sectionIds)
+diff --git a/app/Http/Controllers/Settings/ProfileController.php b/app/Http/Controllers/Settings/ProfileController.php
+index c09c18d..24e18c1 100644
+--- a/app/Http/Controllers/Settings/ProfileController.php
++++ b/app/Http/Controllers/Settings/ProfileController.php
+@@ -8,6 +8,8 @@
+ use App\Models\Section;
+ use App\Models\Workspace;
+ use App\Support\AvatarGallery;
++use App\Support\MobileApi;
++use App\Support\MobileUser;
+ use Illuminate\Contracts\Auth\MustVerifyEmail;
+ use Illuminate\Http\JsonResponse;
+ use Illuminate\Http\RedirectResponse;
+@@ -87,6 +89,10 @@ public function update(ProfileUpdateRequest $request): RedirectResponse
+             Storage::disk('public')->delete($path);
+         }
+ 
++        if (MobileApi::isRequest($request)) {
++            return response()->json(['user' => MobileUser::present($request->user()->fresh(['sections']))]);
++        }
++
+         return to_route('profile.edit');
+     }
+ 
+diff --git a/app/Http/Controllers/UserFollowController.php b/app/Http/Controllers/UserFollowController.php
+index f087db2..b791c8b 100644
+--- a/app/Http/Controllers/UserFollowController.php
++++ b/app/Http/Controllers/UserFollowController.php
+@@ -4,12 +4,14 @@
+ 
+ use App\Models\User;
+ use App\Notifications\UserFollowedNotification;
++use App\Support\MobileApi;
+ use Illuminate\Http\RedirectResponse;
+ use Illuminate\Http\Request;
++use Illuminate\Http\Response;
+ 
+ class UserFollowController extends Controller
+ {
+-    public function store(Request $request, User $user): RedirectResponse
++    public function store(Request $request, User $user): Response
+     {
+         $follower = $request->user();
+ 
+@@ -33,13 +35,21 @@ public function store(Request $request, User $user): RedirectResponse
+             ));
+         }
+ 
++        if (MobileApi::isRequest($request)) {
++            return response()->json(['following' => true]);
++        }
++
+         return back();
+     }
+ 
+-    public function destroy(Request $request, User $user): RedirectResponse
++    public function destroy(Request $request, User $user): Response
+     {
+         $request->user()->following()->detach($user->id);
+ 
++        if (MobileApi::isRequest($request)) {
++            return response()->json(['following' => false]);
++        }
++
+         return back();
+     }
+ }
+diff --git a/app/Http/Middleware/AuthenticateWithMobileToken.php b/app/Http/Middleware/AuthenticateWithMobileToken.php
+new file mode 100644
+index 0000000..dbbd78f
+--- /dev/null
++++ b/app/Http/Middleware/AuthenticateWithMobileToken.php
+@@ -0,0 +1,81 @@
++<?php
++
++namespace App\Http\Middleware;
++
++use App\Models\ApiToken;
++use App\Models\User;
++use Closure;
++use Illuminate\Auth\AuthManager;
++use Illuminate\Http\Request;
++use Symfony\Component\HttpFoundation\Response;
++
++/**
++ * Authenticate a stateless mobile client from its `Authorization: Bearer`
++ * token and bind the resolved user to the request AND the default (`web`)
++ * guard for the duration of this request.
++ *
++ * Why the web guard too: the codebase resolves the current user through
++ * `auth()->user()` (default guard) in policies, gates, and controllers.
++ * `SessionGuard::setUser()` only sets the in-memory user for this request —
++ * it never writes session state — so binding it here makes every existing
++ * authorization path work unchanged for token requests.
++ *
++ * The guard driver itself stays session-based; no new auth driver, no
++ * package dependency, no config change.
++ */
++class AuthenticateWithMobileToken
++{
++    public function __construct(
++        protected AuthManager $auth,
++    ) {}
++
++    public function handle(Request $request, Closure $next): Response
++    {
++        $user = $this->resolveUser($request);
++
++        if (! $user instanceof User) {
++            abort(401, 'Unauthenticated.');
++        }
++
++        $request->setUserResolver(fn (): ?User => $user);
++        $this->auth->guard('web')->setUser($user);
++
++        return $next($request);
++    }
++
++    /**
++     * Memoize on the request (not in process state) so Octane workers can
++     * never leak one request's user into the next.
++     */
++    private function resolveUser(Request $request): ?User
++    {
++        if ($request->attributes->has('mobile_api_user')) {
++            return $request->attributes->get('mobile_api_user');
++        }
++
++        $user = null;
++        $plain = $request->bearerToken();
++
++        if ($plain !== null && $plain !== '') {
++            $row = ApiToken::query()
++                ->where('token', hash('sha256', $plain))
++                ->with('user')
++                ->first();
++
++            if ($row !== null && $row->user !== null) {
++                // Throttle the write: at most one last_used_at touch per
++                // request, and no write at all within the last minute of
++                // polling (part status polls twice a second while grading).
++                if ($row->last_used_at === null || $row->last_used_at->lt(now()->subMinute())) {
++                    $row->forceFill(['last_used_at' => now()])->saveQuietly();
++                }
++
++                $user = $row->user;
++            }
++        }
++
++        $request->attributes->set('mobile_api_user', $user);
++
++        return $user;
++    }
++}
+diff --git a/app/Http/Middleware/EnsureMobileUserIsNotBanned.php b/app/Http/Middleware/EnsureMobileUserIsNotBanned.php
+new file mode 100644
+index 0000000..b2d6a96
+--- /dev/null
++++ b/app/Http/Middleware/EnsureMobileUserIsNotBanned.php
+@@ -0,0 +1,26 @@
++<?php
++
++namespace App\Http\Middleware;
++
++use Closure;
++use Illuminate\Http\Request;
++use Symfony\Component\HttpFoundation\Response;
++
++/**
++ * API mirror of RedirectBannedUsers: the web flow bounces banned students to
++ * the dashboard (they still need to see the notice), but a stateless client
++ * gets an honest 403 with a reason instead of a redirect it cannot follow.
++ */
++class EnsureMobileUserIsNotBanned
++{
++    public function handle(Request $request, Closure $next): Response
++    {
++        if ($request->user()?->is_banned) {
++            return response()->json([
++                'message' => 'Your account is currently suspended. Please contact your teacher.',
++            ], 403);
++        }
++
++        return $next($request);
++    }
++}
+diff --git a/app/Http/Middleware/EnsureStudentPageIsAvailableMobile.php b/app/Http/Middleware/EnsureStudentPageIsAvailableMobile.php
+new file mode 100644
+index 0000000..9c2e35b
+--- /dev/null
++++ b/app/Http/Middleware/EnsureStudentPageIsAvailableMobile.php
+@@ -0,0 +1,33 @@
++<?php
++
++namespace App\Http\Middleware;
++
++use App\Support\StudentPageRegistry;
++use Closure;
++use Illuminate\Http\Request;
++use Symfony\Component\HttpFoundation\Response;
++
++/**
++ * API mirror of EnsureStudentPageIsAvailable: when an admin has disabled a
++ * student page, the web app renders the Inertia "unavailable" screen with a
++ * 423, while stateless clients receive the same 423 as JSON so they can show
++ * an honest empty state instead of a raw HTML page.
++ */
++class EnsureStudentPageIsAvailableMobile
++{
++    public function handle(Request $request, Closure $next, string $pageKey): Response
++    {
++        $control = StudentPageRegistry::controlFor($pageKey);
++
++        if ($request->user()?->is_admin || $control['mode'] !== StudentPageRegistry::MODE_DISABLED) {
++            return $next($request);
++        }
++
++        return response()->json([
++            'response' => $control['message']
++                ?: ($request->isMethod('get')
++                    ? 'This page is temporarily unavailable. Please check back later.'
++                    : 'This student page is currently unavailable.'),
++        ], 423);
++    }
++}
+diff --git a/app/Models/ApiToken.php b/app/Models/ApiToken.php
+new file mode 100644
+index 0000000..b1f7c5a
+--- /dev/null
++++ b/app/Models/ApiToken.php
+@@ -0,0 +1,67 @@
++<?php
++
++namespace App\Models;
++
++use Illuminate\Database\Eloquent\Model;
++use Illuminate\Database\Eloquent\Relations\BelongsTo;
++use Illuminate\Support\Str;
++
++/**
++ * A personal access token for stateless (mobile) clients.
++ *
++ * The plaintext token is returned exactly once at creation time and is never
++ * persisted; only its SHA-256 hash is stored so the column can be looked up
++ * in O(1) and a leaked database never yields usable credentials.
++ */
++class ApiToken extends Model
++{
++    /**
++     * Prefix for the plaintext token, so a pasted token identifies at a
++     * glance which client issued it.
++     */
++    public const MOBILE_APP_PREFIX = 'luav6m_';
++
++    protected $fillable = [
++        'user_id',
++        'name',
++        'token',
++        'last_used_at',
++    ];
++
++    protected $casts = [
++        'last_used_at' => 'datetime',
++    ];
++
++    public function user(): BelongsTo
++    {
++        return $this->belongsTo(User::class);
++    }
++
++    /**
++     * Issue a fresh token for the user.
++     *
++     * @return array{0: static, 1: string} The persisted token row and the
++     *                                     one-time plaintext secret.
++     */
++    public static function issue(User $user, string $name = 'mobile-app'): array
++    {
++        $plain = self::MOBILE_APP_PREFIX.Str::random(40);
++        $hash = hash('sha256', $plain);
++
++        $token = static::create([
++            'user_id' => $user->id,
++            'name' => $name,
++            'token' => $hash,
++        ]);
++
++        return [$token, $plain];
++    }
++
++    /**
++     * Revoke every token issued to the user (mobile logout).
++     */
++    public static function revokeAllFor(User $user): void
++    {
++        static::where('user_id', $user->id)->delete();
++    }
++}
+diff --git a/app/Providers/AppServiceProvider.php b/app/Providers/AppServiceProvider.php
+index 1cd39c7..3dd8f3c 100644
+--- a/app/Providers/AppServiceProvider.php
++++ b/app/Providers/AppServiceProvider.php
+@@ -190,6 +190,12 @@ protected function configureRateLimiting(): void
+         RateLimiter::for('csp-reports', fn (Request $request) => Limit::perMinute(60)->by((string) $request->ip()));
+         RateLimiter::for('claim-xp', fn (Request $request) => Limit::perMinute(10)->by($this->rateLimitKey($request)));
+         RateLimiter::for('claim-bonus-xp', fn (Request $request) => Limit::perMinute(10)->by($this->rateLimitKey($request)));
++
++        // Login attempts are keyed by IP + email so one account being
++        // brute-forced cannot lock out the whole device or the whole office.
++        RateLimiter::for('mobile-login', fn (Request $request) => Limit::perMinute(5)->by(
++            $request->ip().'|'.strtolower((string) $request->input('email', 'none')),
++        ));
+     }
+ 
+     /**
+diff --git a/app/Support/MobileApi.php b/app/Support/MobileApi.php
+new file mode 100644
+index 0000000..a1f24b3
+--- /dev/null
++++ b/app/Support/MobileApi.php
+@@ -0,0 +1,22 @@
++<?php
++
++namespace App\Support;
++
++use Illuminate\Http\Request;
++
++/**
++ * Helper for the handful of web controllers whose actions end in a redirect
++ * (back() / route redirect with a flash message). Mobile requests hit the
++ * exact same action through the /api/mobile/* routes; when the request comes
++ * from that surface the action returns JSON instead of a redirect.
++ *
++ * The gate is the URI prefix, not a header: it cannot be spoofed by a web
++ * client, and it keeps the web flow byte-for-byte identical.
++ */
++class MobileApi
++{
++    public static function isRequest(Request $request): bool
++    {
++        return $request->is('api/mobile/*');
++    }
++}
+diff --git a/app/Support/MobileUser.php b/app/Support/MobileUser.php
+new file mode 100644
+index 0000000..11e759c
+--- /dev/null
++++ b/app/Support/MobileUser.php
+@@ -0,0 +1,57 @@
++<?php
++
++namespace App\Support;
++
++use App\Models\User;
++
++/**
++ * The user shape returned by the mobile API (login, /me, profile updates).
++ * `public_id` is the stable identifier for anything user-facing; the numeric
++ * `id` is included because several API payloads key on it.
++ */
++class MobileUser
++{
++    /**
++     * @return array<string, mixed>
++     */
++    public static function present(User $user): array
++    {
++        $user->loadMissing('sections:id,name');
++
++        return [
++            'id' => $user->id,
++            'public_id' => (string) $user->public_id,
++            'name' => $user->name,
++            'first_name' => $user->first_name,
++            'middle_name' => $user->middle_name,
++            'last_name' => $user->last_name,
++            'email' => $user->email,
++            'avatar' => $user->avatar,
++            'cover_photo' => $user->cover_photo,
++            'bio' => $user->bio,
++            'points' => (int) $user->points,
++            'exp' => (int) $user->exp,
++            'level' => (int) $user->level,
++            'current_streak' => (int) ($user->current_streak ?? 0),
++            'longest_streak' => (int) ($user->longest_streak ?? 0),
++            'is_admin' => (bool) $user->is_admin,
++            'is_super_admin' => (bool) $user->is_super_admin,
++            'is_banned' => (bool) $user->is_banned,
++            'profile_visibility' => $user->profile_visibility,
++            'profile_show_activity' => (bool) ($user->profile_show_activity ?? true),
++            'profile_show_sections' => (bool) ($user->profile_show_sections ?? true),
++            'profile_show_social' => (bool) ($user->profile_show_social ?? true),
++            'profile_show_achievements' => (bool) ($user->profile_show_achievements ?? true),
++            'blur_leaderboard' => (bool) $user->blur_leaderboard,
++            'two_factor_enabled' => $user->hasEnabledTwoFactorAuthentication(),
++            'sections' => $user->sections
++                ->map(fn ($section) => [
++                    'id' => $section->id,
++                    'name' => $section->name,
++                ])
++                ->values()
++                ->all(),
++            'created_at' => $user->created_at?->toIso8601String(),
++        ];
++    }
++}
+diff --git a/bootstrap/app.php b/bootstrap/app.php
+index 65b3f91..f6936bf 100644
+--- a/bootstrap/app.php
++++ b/bootstrap/app.php
+@@ -1,7 +1,10 @@
+ <?php
+ 
++use App\Http\Middleware\AuthenticateWithMobileToken;
+ use App\Http\Middleware\EnsureLoginIsEnabled;
++use App\Http\Middleware\EnsureMobileUserIsNotBanned;
+ use App\Http\Middleware\EnsureStudentPageIsAvailable;
++use App\Http\Middleware\EnsureStudentPageIsAvailableMobile;
+ use App\Http\Middleware\HandleAppearance;
+ use App\Http\Middleware\HandleInertiaRequests;
+ use App\Http\Middleware\RedirectBannedUsers;
+@@ -16,6 +19,7 @@
+ return Application::configure(basePath: dirname(__DIR__))
+     ->withRouting(
+         web: __DIR__.'/../routes/web.php',
++        api: __DIR__.'/../routes/api.php',
+         commands: __DIR__.'/../routes/console.php',
+         channels: __DIR__.'/../routes/channels.php',
+         health: '/up',
+@@ -34,6 +38,11 @@
+         $middleware->alias([
+             'banned.redirect' => RedirectBannedUsers::class,
+             'student.page' => EnsureStudentPageIsAvailable::class,
++            // Stateless mobile API (routes/api.php): token auth + API-shaped
++            // mirrors of the session redirects the web flow relies on.
++            'auth.mobile' => AuthenticateWithMobileToken::class,
++            'banned.mobile' => EnsureMobileUserIsNotBanned::class,
++            'student.page.mobile' => EnsureStudentPageIsAvailableMobile::class,
+         ]);
+ 
+         $middleware->web(append: [
+diff --git a/database/migrations/2026_09_03_100000_create_api_tokens_table.php b/database/migrations/2026_09_03_100000_create_api_tokens_table.php
+new file mode 100644
+index 0000000..0a8a6b7
+--- /dev/null
++++ b/database/migrations/2026_09_03_100000_create_api_tokens_table.php
+@@ -0,0 +1,31 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++/**
++ * Personal access tokens for the LSI mobile app (and any future first-party
++ * token clients). Only the SHA-256 hash of each token is stored — a database
++ * leak never exposes usable credentials, matching the approach Laravel
++ * Sanctum uses for its API tokens.
++ */
++return new class extends Migration
++{
++    public function up(): void
++    {
++        Schema::create('api_tokens', function (Blueprint $table) {
++            $table->id();
++            $table->foreignId('user_id')->constrained()->cascadeOnDelete();
++            $table->string('name');
++            $table->string('token', 64)->unique();
++            $table->timestamp('last_used_at')->nullable();
++            $table->timestamps();
++        });
++    }
++
++    public function down(): void
++    {
++        Schema::dropIfExists('api_tokens');
++    }
++};
+diff --git a/routes/api.php b/routes/api.php
+new file mode 100644
+index 0000000..04314f4
+--- /dev/null
++++ b/routes/api.php
+@@ -0,0 +1,132 @@
++<?php
++
++use App\Http\Controllers\Api\BonusClaimController;
++use App\Http\Controllers\Api\ClaimXpController;
++use App\Http\Controllers\Api\DashboardExamsController;
++use App\Http\Controllers\Api\LeaderboardController;
++use App\Http\Controllers\Api\Mobile\MobileAuthController;
++use App\Http\Controllers\Api\Mobile\MobileCalendarController;
++use App\Http\Controllers\Api\XpHistoryController;
++use App\Http\Controllers\ActivityHubController;
++use App\Http\Controllers\AnonymousMessageController;
++use App\Http\Controllers\AssignmentController;
++use App\Http\Controllers\ChatHistoryController;
++use App\Http\Controllers\CourseController;
++use App\Http\Controllers\DashboardController;
++use App\Http\Controllers\ExamController;
++use App\Http\Controllers\GradeController;
++use App\Http\Controllers\ProfileKudoController;
++use App\Http\Controllers\PublicProfileController;
++use App\Http\Controllers\Settings\ProfileController;
++use App\Http\Controllers\UserFollowController;
++use Illuminate\Support\Facades\Route;
++
++/*
++|--------------------------------------------------------------------------
++| Mobile API
++|--------------------------------------------------------------------------
++|
++| JSON surface for the LSI mobile app. Lives in the `api` middleware group
++| (no CSRF, no session) and authenticates with personal access tokens
++| issued by POST api/mobile/auth/login.
++|
++| Data actions are deliberately the SAME methods the web app calls — the
++| only difference is that a request from this prefix receives JSON where
++| the web flow would receive a redirect. The web app is unaffected: it
++| never calls /api/mobile/* and its session + CSRF behavior is untouched.
++|
++*/
++
++Route::prefix('mobile')->group(function () {
++    // ── Auth ─────────────────────────────────────────────────────────
++    Route::post('auth/login', [MobileAuthController::class, 'login'])
++        ->middleware('throttle:mobile-login');
++
++    Route::middleware(['auth.mobile', 'banned.mobile'])->group(function () {
++        Route::post('auth/logout', [MobileAuthController::class, 'logout']);
++        Route::get('auth/two-factor', [MobileAuthController::class, 'twoFactorStatus']);
++        Route::post('auth/two-factor', [MobileAuthController::class, 'twoFactorEnable']);
++        Route::post('auth/two-factor/confirm', [MobileAuthController::class, 'twoFactorConfirm']);
++        Route::delete('auth/two-factor', [MobileAuthController::class, 'twoFactorDisable']);
++
++        Route::get('me', [MobileAuthController::class, 'me']);
++        Route::patch('me', [ProfileController::class, 'update']);
++        Route::put('password', [MobileAuthController::class, 'updatePassword']);
++
++        // ── Home / dashboard ─────────────────────────────────────────
++        Route::get('dashboard', [DashboardController::class, 'mobile'])
++            ->middleware('student.page.mobile:dashboard');
++        Route::get('calendar', [MobileCalendarController::class, '__invoke'])
++            ->middleware('student.page.mobile:calendar');
++        Route::get('dashboard-exams', DashboardExamsController::class);
++        Route::get('leaderboard', LeaderboardController::class)
++            ->middleware('student.page.mobile:leaderboard');
++        Route::get('grades', [GradeController::class, 'apiIndex'])
++            ->middleware('student.page.mobile:grades');
++
++        // ── Exams ────────────────────────────────────────────────────
++        Route::middleware('student.page.mobile:exams')->group(function () {
++            Route::get('exams', [ExamController::class, 'listing']);
++            Route::get('exams/{exam}', [ExamController::class, 'mobileShow']);
++            Route::get('exams/{exam}/review', [ExamController::class, 'review']);
++
++            Route::post('exams/{exam}/parts/{examPart}/start', [ExamController::class, 'startPart'])
++                ->middleware('throttle:exams.start');
++            Route::put('exams/{exam}/parts/{examPart}/answers', [ExamController::class, 'saveAnswers'])
++                ->middleware('throttle:exams.answers');
++            Route::post('exams/{exam}/parts/{examPart}/submit', [ExamController::class, 'submitPart'])
++                ->middleware('throttle:exams.submit');
++            Route::post('exams/{exam}/parts/{examPart}/status', [ExamController::class, 'partStatus'])
++                ->middleware('throttle:exams.status');
++        });
++
++        Route::get('activities', [ActivityHubController::class, 'listing'])
++            ->middleware('student.page.mobile:exams');
++
++        // ── Assignments ──────────────────────────────────────────────
++        Route::middleware('student.page.mobile:assignments')->group(function () {
++            Route::get('assignments', [AssignmentController::class, 'mobileIndex']);
++            Route::post('assignments/{assignment}/submit', [AssignmentController::class, 'store']);
++            Route::post('assignments/{assignment}/feedback-seen', [AssignmentController::class, 'markFeedbackSeen']);
++        });
++
++        // ── Courses ──────────────────────────────────────────────────
++        Route::middleware('student.page.mobile:courses')->group(function () {
++            Route::get('courses', [CourseController::class, 'mobileIndex']);
++            Route::get('courses/{course}', [CourseController::class, 'mobileShow']);
++            Route::get('courses/{course}/lessons/{lesson}', [CourseController::class, 'mobileLesson']);
++            Route::post('courses/{course}/lessons/{lesson}/quiz', [CourseController::class, 'submitQuiz'])
++                ->middleware('throttle:10,1');
++        });
++
++        // ── Gamification ─────────────────────────────────────────────
++        Route::post('claim-xp', ClaimXpController::class)->middleware('throttle:claim-xp');
++        Route::post('claim-bonus-xp', BonusClaimController::class)->middleware('throttle:claim-bonus-xp');
++        Route::get('users/{user}/xp-history', XpHistoryController::class);
++
++        // ── Chat ─────────────────────────────────────────────────────
++        Route::middleware('student.page.mobile:chats')->group(function () {
++            Route::get('chats', [ChatHistoryController::class, 'sessions']);
++            Route::post('chats', [ChatHistoryController::class, 'store'])->middleware('throttle:chats');
++            Route::get('chats/{session}/messages', [ChatHistoryController::class, 'messages']);
++            Route::post('chats/{session}/messages', [ChatHistoryController::class, 'message'])->middleware('throttle:chats');
++            Route::delete('chats/{session}', [ChatHistoryController::class, 'destroy']);
++        });
++
++        // ── NGL (anonymous messages) ─────────────────────────────────
++        Route::middleware('student.page.mobile:ngl')->group(function () {
++            Route::get('ngl', [AnonymousMessageController::class, 'feed']);
++            Route::post('ngl', [AnonymousMessageController::class, 'store']);
++            Route::post('ngl/{message}/like', [AnonymousMessageController::class, 'like']);
++        });
++
++        // ── Profiles & social ────────────────────────────────────────
++        Route::get('u/{user:public_id}', [PublicProfileController::class, 'mobileShow']);
++        Route::post('u/{user:public_id}/follow', [UserFollowController::class, 'store']);
++        Route::delete('u/{user:public_id}/follow', [UserFollowController::class, 'destroy']);
++        Route::post('u/{user:public_id}/kudos', [ProfileKudoController::class, 'store']);
++
++        // ── Sections ─────────────────────────────────────────────────
++        Route::post('sections/join-by-code', [ProfileController::class, 'joinByCode']);
++    });
++});
+diff --git a/tests/Feature/MobileApiTest.php b/tests/Feature/MobileApiTest.php
+new file mode 100644
+index 0000000..56a5410
+--- /dev/null
++++ b/tests/Feature/MobileApiTest.php
+@@ -0,0 +1,548 @@
++<?php
++
++use App\Models\ApiToken;
++use App\Models\Exam;
++use App\Models\ExamPart;
++use App\Models\Setting;
++use App\Models\User;
++use Illuminate\Support\Facades\Hash;
++use Laravel\Fortify\Contracts\TwoFactorAuthenticationProvider;
++use Laravel\Fortify\Fortify;
++
++use function Pest\Laravel\post;
++
++/*
++|--------------------------------------------------------------------------
++| Mobile API (routes/api.php)
++|--------------------------------------------------------------------------
++|
++| The mobile app authenticates with a Bearer token issued by
++| POST /api/mobile/auth/login and then calls the /api/mobile/* JSON
++| surface. These tests cover auth, token lifecycle, 2FA, banned users,
++| and a representative slice of the data endpoints — plus a web-route
++| regression check to prove the session flow is untouched.
++|
++*/
++
++function mobileLogin(User $user, array $overrides = []): \Illuminate\Testing\TestResponse
++{
++    return post('/api/mobile/auth/login', array_merge([
++        'email' => $user->email,
++        'password' => 'password',
++    ], $overrides));
++}
++
++function mobileToken(User $user): string
++{
++    $token = mobileLogin($user)->assertOk()->json('token');
++
++    expect($token)->toBeString()->toStartWith(ApiToken::MOBILE_APP_PREFIX);
++
++    return $token;
++}
++
++// ── Login ────────────────────────────────────────────────────────────
++
++it('issues a token and user payload on valid credentials', function () {
++    $user = User::factory()->create(['name' => 'Mobile Student']);
++
++    $token = mobileLogin($user)
++        ->assertOk()
++        ->assertJsonStructure(['token', 'user' => ['id', 'public_id', 'name', 'email', 'avatar', 'sections', 'two_factor_enabled']])
++        ->assertJsonPath('user.name', 'Mobile Student')
++        ->assertJsonPath('user.email', $user->email)
++        ->json('token');
++
++    expect($token)->toBeString()->toStartWith(ApiToken::MOBILE_APP_PREFIX);
++
++    // The database stores the hash, never the usable plaintext.
++    expect(ApiToken::count())->toBe(1)
++        ->and(ApiToken::first()->token)->toBe(hash('sha256', $token))
++        ->and(ApiToken::first()->token)->not->toBe($token);
++});
++
++it('rejects an unknown email with a 422', function () {
++    post('/api/mobile/auth/login', ['email' => 'ghost@example.com', 'password' => 'password'])
++        ->assertUnprocessable()
++        ->assertJsonValidationErrors(['email']);
++});
++
++it('rejects a wrong password with a 422', function () {
++    $user = User::factory()->create();
++
++    mobileLogin($user, ['password' => 'wrong-password'])
++        ->assertUnprocessable()
++        ->assertJsonValidationErrors(['email']);
++
++    expect(ApiToken::count())->toBe(0);
++});
++
++it('honors the login_enabled setting with an admin exception', function () {
++    Setting::setGlobal('login_enabled', false);
++    Setting::setGlobal('login_disabled_message', 'Enrollment is closed.');
++
++    $student = User::factory()->create();
++    $admin = User::factory()->create(['is_admin' => true]);
++
++    mobileLogin($student)
++        ->assertUnprocessable()
++        ->assertJsonValidationErrors(['email']);
++
++    mobileLogin($admin)->assertOk()->assertJsonStructure(['token', 'user']);
++
++    Setting::setGlobal('login_enabled', true);
++});
++
++it('refuses to sign a banned student in', function () {
++    $banned = User::factory()->create(['is_banned' => true]);
++
++    mobileLogin($banned)
++        ->assertForbidden()
++        ->assertJsonStructure(['message']);
++
++    expect(ApiToken::count())->toBe(0);
++});
++
++// ── Token lifecycle ──────────────────────────────────────────────────
++
++it('authenticates requests with a valid Bearer token', function () {
++    $user = User::factory()->create();
++    $token = mobileToken($user);
++
++    $this->withHeaders(['Authorization' => 'Bearer '.$token])
++        ->getJson('/api/mobile/me')
++        ->assertOk()
++        ->assertJsonPath('user.email', $user->email)
++        ->assertJsonPath('user.name', $user->name);
++});
++
++it('rejects requests without a token', function () {
++    $this->getJson('/api/mobile/me')->assertUnauthorized();
++});
++
++it('rejects a malformed or unknown token', function () {
++    $this->withHeaders(['Authorization' => 'Bearer not-a-real-token'])
++        ->getJson('/api/mobile/me')
++        ->assertUnauthorized();
++
++    $this->withHeaders(['Authorization' => 'Token luav6m_abc'])
++        ->getJson('/api/mobile/me')
++        ->assertUnauthorized();
++});
++
++it('lets a user out via logout and the token stops working', function () {
++    $user = User::factory()->create();
++    $token = mobileToken($user);
++
++    expect(ApiToken::count())->toBe(1);
++
++    $this->withHeaders(['Authorization' => 'Bearer '.$token])
++        ->postJson('/api/mobile/auth/logout')
++        ->assertOk()
++        ->assertJsonPath('ok', true);
++
++    expect(ApiToken::count())->toBe(0);
++
++    $this->withHeaders(['Authorization' => 'Bearer '.$token])
++        ->getJson('/api/mobile/me')
++        ->assertUnauthorized();
++});
++
++it('updates the token last-used timestamp on a new request', function () {
++    $user = User::factory()->create();
++    $token = mobileToken($user);
++
++    $row = ApiToken::first();
++    expect($row->last_used_at)->toBeNull();
++
++    $this->withHeaders(['Authorization' => 'Bearer '.$token])->getJson('/api/mobile/me')->assertOk();
++
++    expect(ApiToken::first()->last_used_at)->not->toBeNull();
++});
++
++it('serves banned users a 403 on authenticated routes', function () {
++    $user = User::factory()->create();
++    $token = mobileToken($user);
++    $user->update(['is_banned' => true]);
++
++    $this->withHeaders(['Authorization' => 'Bearer '.$token])
++        ->getJson('/api/mobile/me')
++        ->assertForbidden()
++        ->assertJsonStructure(['message']);
++});
++
++// ── Two-factor login ─────────────────────────────────────────────────
++
++it('requests the second factor when 2FA is enabled', function () {
++    $user = User::factory()->create();
++    $user->forceFill([
++        'two_factor_secret' => encrypt('JBSWY3DPEHPK3PXP'),
++        'two_factor_recovery_codes' => encrypt(json_encode(['recovery-one', 'recovery-two'])),
++        'two_factor_confirmed_at' => now(),
++    ])->save();
++
++    mobileLogin($user)
++        ->assertOk()
++        ->assertJsonPath('requires_two_factor', true)
++        ->assertJsonMissing('token');
++
++    expect(ApiToken::count())->toBe(0);
++});
++
++it('issues a token when a valid TOTP code is supplied', function () {
++    $user = User::factory()->create();
++    $secret = 'JBSWY3DPEHPK3PXP';
++    $user->forceFill([
++        'two_factor_secret' => encrypt($secret),
++        'two_factor_recovery_codes' => encrypt(json_encode(['r-1', 'r-2'])),
++        'two_factor_confirmed_at' => now(),
++    ])->save();
++
++    // A real Google2FA OTP for the stored secret — the same library Fortify
++    // uses to verify, so this proves the login path accepts genuine codes.
++    $otp = (new PragmaRX\Google2FA\Google2FA($secret))->getCurrentOtp();
++
++    mobileLogin($user, ['two_factor_code' => $otp])
++        ->assertOk()
++        ->assertJsonStructure(['token', 'user'])
++        ->assertJsonMissing('requires_two_factor');
++});
++
++it('rejects an invalid 2FA code with a 422', function () {
++    $user = User::factory()->create();
++    $user->forceFill([
++        'two_factor_secret' => encrypt('JBSWY3DPEHPK3PXP'),
++        'two_factor_recovery_codes' => encrypt(json_encode(['r-1'])),
++        'two_factor_confirmed_at' => now(),
++    ])->save();
++
++    mobileLogin($user, ['two_factor_code' => '000000'])
++        ->assertUnprocessable()
++        ->assertJsonValidationErrors(['two_factor_code']);
++
++    expect(ApiToken::count())->toBe(0);
++});
++
++it('accepts a recovery code once, then revokes it', function () {
++    $user = User::factory()->create();
++    $user->forceFill([
++        'two_factor_secret' => encrypt('JBSWY3DPEHPK3PXP'),
++        'two_factor_recovery_codes' => encrypt(json_encode(['use-me-once'])),
++        'two_factor_confirmed_at' => now(),
++    ])->save();
++
++    mobileLogin($user, ['two_factor_code' => 'use-me-once'])->assertOk();
++
++    $codes = json_decode(Fortify::currentEncrypter()->decrypt($user->fresh()->two_factor_recovery_codes), true);
++    expect($codes)->not->toContain('use-me-once');
++
++    // The same code cannot be replayed.
++    mobileLogin($user, ['two_factor_code' => 'use-me-once'])
++        ->assertUnprocessable()
++        ->assertJsonValidationErrors(['two_factor_code']);
++});
++
++// ── Two-factor management ────────────────────────────────────────────
++
++it('enables, confirms and disables 2FA for the signed-in user', function () {
++    $user = User::factory()->create();
++    $token = mobileToken($user);
++    $headers = ['Authorization' => 'Bearer '.$token];
++
++    $this->withHeaders($headers)
++        ->postJson('/api/mobile/auth/two-factor')
++        ->assertOk()
++        ->assertJsonStructure(['secret', 'otpauth_url', 'recovery_codes']);
++
++    $secret = $user->fresh()->two_factor_secret;
++    expect($secret)->not->toBeNull();
++
++    $otp = (new PragmaRX\Google2FA\Google2FA(
++        Fortify::currentEncrypter()->decrypt($secret)
++    ))->getCurrentOtp();
++
++    $this->withHeaders($headers)
++        ->postJson('/api/mobile/auth/two-factor/confirm', ['code' => $otp])
++        ->assertOk()
++        ->assertJsonPath('enabled', true);
++
++    $this->withHeaders($headers)
++        ->getJson('/api/mobile/auth/two-factor')
++        ->assertJsonPath('enabled', true);
++
++    $this->withHeaders($headers)
++        ->deleteJson('/api/mobile/auth/two-factor')
++        ->assertOk()
++        ->assertJsonPath('enabled', false);
++
++    $user->refresh();
++    expect($user->two_factor_secret)->toBeNull()
++        ->and($user->two_factor_confirmed_at)->toBeNull();
++});
++
++it('rejects confirming 2FA with a bad code', function () {
++    $user = User::factory()->create();
++    $token = mobileToken($user);
++
++    $this->withHeaders(['Authorization' => 'Bearer '.$token])
++        ->postJson('/api/mobile/auth/two-factor')
++        ->assertOk();
++
++    $this->withHeaders(['Authorization' => 'Bearer '.$token])
++        ->postJson('/api/mobile/auth/two-factor/confirm', ['code' => '000000'])
++        ->assertUnprocessable();
++});
++
++// ── Account management ───────────────────────────────────────────────
++
++it('updates the profile through PATCH /api/mobile/me', function () {
++    $user = User::factory()->create();
++    $token = mobileToken($user);
++
++    $this->withHeaders(['Authorization' => 'Bearer '.$token])
++        ->patchJson('/api/mobile/me', ['name' => 'Renamed Student'])
++        ->assertOk()
++        ->assertJsonPath('user.name', 'Renamed Student');
++
++    expect($user->fresh()->name)->toBe('Renamed Student');
++});
++
++it('updates the password and the new password logs in', function () {
++    $user = User::factory()->create();
++    $token = mobileToken($user);
++
++    $this->withHeaders(['Authorization' => 'Bearer '.$token])
++        ->putJson('/api/mobile/password', [
++            'current_password' => 'password',
++            'password' => 'Str0ngNew!Pass',
++            'password_confirmation' => 'Str0ngNew!Pass',
++        ])
++        ->assertOk();
++
++    mobileLogin($user, ['password' => 'password'])->assertUnprocessable();
++    mobileLogin($user, ['password' => 'Str0ngNew!Pass'])->assertOk();
++});
++
++it('rejects a password change with the wrong current password', function () {
++    $user = User::factory()->create();
++    $token = mobileToken($user);
++
++    $this->withHeaders(['Authorization' => 'Bearer '.$token])
++        ->putJson('/api/mobile/password', [
++            'current_password' => 'nope',
++            'password' => 'Str0ngNew!Pass',
++            'password_confirmation' => 'Str0ngNew!Pass',
++        ])
++        ->assertUnprocessable()
++        ->assertJsonValidationErrors(['current_password']);
++});
++
++// ── Data endpoints ───────────────────────────────────────────────────
++
++it('serves the dashboard payload as JSON', function () {
++    $user = User::factory()->create();
++
++    $this->withHeaders(['Authorization' => 'Bearer '.mobileToken($user)])
++        ->getJson('/api/mobile/dashboard')
++        ->assertOk()
++        ->assertJsonStructure([
++            'claimXp' => ['enabled', 'canClaim', 'amount'],
++            'userStats' => ['totalXP', 'level', 'streak'],
++            'upcomingExams',
++            'announcements',
++            'courses',
++            'assignments',
++            'sectionLeaderboards',
++            'activeSeason',
++            'sectionName',
++        ]);
++});
++
++it('serves the exam listing grouped by season', function () {
++    $user = User::factory()->create();
++    Exam::factory()->published()->create(['title' => 'Open exam']);
++
++    $this->withHeaders(['Authorization' => 'Bearer '.mobileToken($user)])
++        ->getJson('/api/mobile/exams')
++        ->assertOk()
++        ->assertJsonStructure(['data' => [['seasonName', 'exams']], 'meta' => ['hasMore', 'nextCursor']]);
++});
++
++it('serves a full exam (parts + questions) for taking', function () {
++    $user = User::factory()->create();
++    $exam = Exam::factory()->published()->create(['title' => 'Take me']);
++    ExamPart::factory()->forExam($exam)->multipleChoice(2)->create();
++
++    $this->withHeaders(['Authorization' => 'Bearer '.mobileToken($user)])
++        ->getJson('/api/mobile/exams/'.$exam->id)
++        ->assertOk()
++        ->assertJsonStructure([
++            'exam' => ['id', 'title', 'parts', 'is_open_now', 'starts_at_iso', 'ends_at_iso'],
++            'submissions',
++            'partDeadlines',
++            'answerDrafts',
++            'xpAward',
++        ])
++        ->assertJsonPath('exam.title', 'Take me');
++});
++
++it('runs the start, save and submit part flow and rejects a second submit', function () {
++    $user = User::factory()->create();
++    $exam = Exam::factory()->published()->create();
++    $part = ExamPart::factory()->forExam($exam)->multipleChoice(2)->create();
++    $token = mobileToken($user);
++    $headers = ['Authorization' => 'Bearer '.$token];
++
++    $base = '/api/mobile/exams/'.$exam->id.'/parts/'.$part->id;
++
++    $this->withHeaders($headers)->postJson($base.'/start')
++        ->assertOk()
++        ->assertJsonStructure(['started_at', 'deadline']);
++
++    $this->withHeaders($headers)->putJson($base.'/answers', [
++        'answers' => [
++            ['question_number' => 1, 'answer' => 1],
++            ['question_number' => 2, 'answer' => 0],
++        ],
++    ])
++        ->assertOk()
++        ->assertJsonStructure(['saved_at', 'question_numbers', 'answered_count'])
++        ->assertJsonPath('answered_count', 2);
++
++    $this->withHeaders($headers)->postJson($base.'/submit', [
++        'answers' => [
++            ['question_number' => 1, 'answer' => 1],
++            ['question_number' => 2, 'answer' => 0],
++        ],
++    ])
++        ->assertOk()
++        ->assertJsonPath('submitted_part', $part->id);
++
++    // Single attempt per part, same rule as the web.
++    $this->withHeaders($headers)->postJson($base.'/submit', [
++        'answers' => [['question_number' => 1, 'answer' => 1]],
++    ])->assertConflict();
++
++    $this->withHeaders($headers)->postJson($base.'/status')
++        ->assertOk()
++        ->assertJsonStructure(['status', 'scored', 'score', 'is_late', 'grading_failed', 'awaiting_teacher_review', 'xp_award']);
++});
++
++it('serves grades, calendar, leaderboard, activities and assignments as JSON', function () {
++    $user = User::factory()->create();
++    $token = mobileToken($user);
++    $headers = ['Authorization' => 'Bearer '.$token];
++
++    $this->withHeaders($headers)->getJson('/api/mobile/grades')
++        ->assertOk()->assertJsonStructure(['subjectGrades']);
++
++    $this->withHeaders($headers)->getJson('/api/mobile/calendar')
++        ->assertOk()->assertJsonStructure(['todayKey']);
++
++    $this->withHeaders($headers)->getJson('/api/mobile/leaderboard')
++        ->assertOk()->assertJsonStructure(['leaderboards', 'selectedSeason']);
++
++    $this->withHeaders($headers)->getJson('/api/mobile/activities')
++        ->assertOk()->assertJsonStructure(['data', 'meta']);
++
++    $this->withHeaders($headers)->getJson('/api/mobile/assignments')
++        ->assertOk()->assertJsonStructure(['assignments']);
++
++    $this->withHeaders($headers)->getJson('/api/mobile/dashboard-exams')
++        ->assertOk()->assertJsonStructure(['exams']);
++});
++
++it('serves the NGL feed and accepts a new message', function () {
++    $user = User::factory()->create();
++    $token = mobileToken($user);
++    $headers = ['Authorization' => 'Bearer '.$token];
++
++    $this->withHeaders($headers)->getJson('/api/mobile/ngl')
++        ->assertOk()
++        ->assertJsonStructure(['data', 'userLikedMessageIds', 'meta']);
++
++    $this->withHeaders($headers)->postJson('/api/mobile/ngl', ['content' => 'Anonymous hello'])
++        ->assertOk()
++        ->assertJsonPath('sent', true);
++});
++
++it('serves chat sessions and creates a new one', function () {
++    $user = User::factory()->create();
++    $token = mobileToken($user);
++    $headers = ['Authorization' => 'Bearer '.$token];
++
++    $this->withHeaders($headers)->getJson('/api/mobile/chats')
++        ->assertOk()
++        ->assertJsonStructure(['data', 'meta']);
++
++    $this->withHeaders($headers)->postJson('/api/mobile/chats')
++        ->assertOk()
++        ->assertJsonStructure(['session' => ['id']]);
++});
++
++it('serves the public profile JSON for a shared-section user', function () {
++    $viewer = User::factory()->create();
++    $profiled = User::factory()->create();
++
++    // Shared section so the profile interaction gates allow the view.
++    $section = \App\Models\Section::factory()->create();
++    $viewer->sections()->attach($section->id);
++    $profiled->sections()->attach($section->id);
++
++    $token = mobileToken($viewer);
++
++    $this->withHeaders(['Authorization' => 'Bearer '.$token])
++        ->getJson('/api/mobile/u/'.$profiled->public_id)
++        ->assertOk()
++        ->assertJsonStructure([
++            'profileUser' => ['id', 'name', 'avatar', 'sections'],
++            'stats',
++            'kudos',
++            'isFollowing',
++        ]);
++});
++
++it('follows and unfollows through the JSON endpoints', function () {
++    $viewer = User::factory()->create();
++    $profiled = User::factory()->create();
++
++    $section = \App\Models\Section::factory()->create();
++    $viewer->sections()->attach($section->id);
++    $profiled->sections()->attach($section->id);
++
++    $token = mobileToken($viewer);
++    $headers = ['Authorization' => 'Bearer '.$token];
++
++    $this->withHeaders($headers)->postJson('/api/mobile/u/'.$profiled->public_id.'/follow')
++        ->assertOk()
++        ->assertJsonPath('following', true);
++
++    expect($viewer->fresh()->following()->whereKey($profiled->id)->exists())->toBeTrue();
++
++    $this->withHeaders($headers)->deleteJson('/api/mobile/u/'.$profiled->public_id.'/follow')
++        ->assertOk()
++        ->assertJsonPath('following', false);
++});
++
++// ── Web regression: the session flow is untouched ────────────────────
++
++it('still serves the web dashboard through the session guard', function () {
++    $user = User::factory()->create();
++
++    $this->actingAs($user)
++        ->get('/dashboard')
++        ->assertOk()
++        ->assertInertia(fn ($page) => $page->component('Dashboard'));
++});
++
++it('still redirects web exam submissions (no JSON leak into the web flow)', function () {
++    $user = User::factory()->create();
++    $exam = Exam::factory()->published()->create();
++    $part = ExamPart::factory()->forExam($exam)->multipleChoice(1)->create();
++
++    $this->actingAs($user)
++        ->post('/exams/'.$exam->id.'/parts/'.$part->id.'/submit', [
++            'answers' => [['question_number' => 1, 'answer' => 0]],
++        ])
++        ->assertRedirect('/exams/'.$exam->id);
++});
+-- 
+2.39.5
+
